@@ -23,6 +23,7 @@ mod unified;
 
 pub use bolt11::Bolt11Payment;
 pub(crate) use bolt11::PaymentMetadata;
+pub(crate) use bolt12::PendingBolt12InvoiceContexts;
 pub use bolt12::{Bolt12Payment, PayerProofOptions};
 pub use forwarding::{
 	ChannelForwardingStats, ChannelForwardingStatsPage, ChannelPairForwardingStats,

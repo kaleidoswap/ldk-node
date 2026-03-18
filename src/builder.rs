@@ -2564,6 +2564,7 @@ fn build_with_store_internal(
 			max_locked_msat: probing_cfg.max_locked_msat,
 		})
 	});
+	let pending_bolt12_invoice_contexts = Arc::new(Mutex::new(HashMap::new()));
 
 	#[cfg(cycle_tests)]
 	let mut _leak_checker = crate::LeakChecker(Vec::new());
@@ -2627,6 +2628,7 @@ fn build_with_store_internal(
 		prober,
 		#[cfg(cycle_tests)]
 		_leak_checker,
+		pending_bolt12_invoice_contexts,
 	})
 }
 
