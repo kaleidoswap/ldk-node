@@ -2140,6 +2140,8 @@ fn build_with_store_internal(
 
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
+	let pending_bolt12_invoice_contexts = Arc::new(Mutex::new(HashMap::new()));
+
 	#[cfg(cycle_tests)]
 	let mut _leak_checker = crate::LeakChecker(Vec::new());
 	#[cfg(cycle_tests)]
@@ -2187,6 +2189,7 @@ fn build_with_store_internal(
 		hrn_resolver,
 		#[cfg(cycle_tests)]
 		_leak_checker,
+		pending_bolt12_invoice_contexts,
 	})
 }
 
