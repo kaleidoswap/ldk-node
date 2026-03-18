@@ -202,6 +202,7 @@ pub use vss_client;
 use crate::config::{LIQUIDITY_DISCOVERY_RETRY_INITIAL_DELAY, LIQUIDITY_DISCOVERY_RETRY_MAX_DELAY};
 use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::liquidity::Liquidity;
+use crate::payment::PendingBolt12InvoiceContexts;
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
 
@@ -283,6 +284,7 @@ pub struct Node {
 	#[cfg(feature = "unified-payments")]
 	hrn_resolver: HRNResolver,
 	prober: Option<Arc<Prober>>,
+	pending_bolt12_invoice_contexts: PendingBolt12InvoiceContexts,
 	#[cfg(cycle_tests)]
 	_leak_checker: LeakChecker,
 }
@@ -700,6 +702,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			Arc::clone(&self.pending_bolt12_invoice_contexts),
 		));
 
 		if let Some(prober) = self.prober.clone() {
@@ -1092,6 +1095,7 @@ impl Node {
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
 			self.async_payments_role,
+			Arc::clone(&self.pending_bolt12_invoice_contexts),
 		)
 	}
 
@@ -1109,6 +1113,7 @@ impl Node {
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
 			self.async_payments_role,
+			Arc::clone(&self.pending_bolt12_invoice_contexts),
 		))
 	}
 

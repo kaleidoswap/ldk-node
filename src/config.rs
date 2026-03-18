@@ -295,6 +295,20 @@ pub struct Config {
 	pub manually_handle_unknown_bolt11_payments: bool,
 	/// The mode used for tracking forwarded payments.
 	pub forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode,
+	/// If set to `true`, BOLT12 invoices will not be paid automatically when received. Instead, an
+	/// [`Event::Bolt12InvoiceReceived`] event will be emitted, allowing inspection of the invoice
+	/// before explicitly paying via [`Bolt12Payment::send_payment_for_bolt12_invoice`] or
+	/// abandoning via [`Bolt12Payment::abandon_bolt12_invoice`].
+	///
+	/// **Note:** If the invoice is not paid or abandoned before the next LDK timer tick, the
+	/// payment will be timed out automatically.
+	///
+	/// Default value: `false`
+	///
+	/// [`Event::Bolt12InvoiceReceived`]: crate::Event::Bolt12InvoiceReceived
+	/// [`Bolt12Payment::send_payment_for_bolt12_invoice`]: crate::payment::Bolt12Payment::send_payment_for_bolt12_invoice
+	/// [`Bolt12Payment::abandon_bolt12_invoice`]: crate::payment::Bolt12Payment::abandon_bolt12_invoice
+	pub manually_handle_bolt12_invoices: bool,
 }
 
 impl Default for Config {
@@ -314,6 +328,7 @@ impl Default for Config {
 			hrn_config: HumanReadableNamesConfig::default(),
 			manually_handle_unknown_bolt11_payments: false,
 			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			manually_handle_bolt12_invoices: false,
 		}
 	}
 }
@@ -514,6 +529,7 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments =
 		config.anchor_channels_config.enable_zero_fee_commitments;
 	user_config.reject_inbound_splices = false;
+	user_config.manually_handle_bolt12_invoices = config.manually_handle_bolt12_invoices;
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
