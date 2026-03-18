@@ -63,6 +63,7 @@ use crate::payment::store::{
 	TransactionType,
 };
 use crate::payment::PaymentMetadata;
+use crate::payment::PendingBolt12InvoiceContexts;
 use crate::probing::Prober;
 use crate::runtime::Runtime;
 use crate::types::{
@@ -509,6 +510,25 @@ pub enum Event {
 		/// before an upgrade to this version and reports after it.
 		parameters: Option<SpliceParameters>,
 	},
+	/// A BOLT12 invoice has been received, and is waiting to be paid or abandoned.
+	///
+	/// This event will only be generated if [`Config::manually_handle_bolt12_invoices`] is set
+	/// to `true`.
+	///
+	/// Call [`Bolt12Payment::send_payment_for_bolt12_invoice`] to pay the invoice or
+	/// [`Bolt12Payment::abandon_bolt12_invoice`] to abandon it.
+	///
+	/// [`Config::manually_handle_bolt12_invoices`]: crate::config::Config::manually_handle_bolt12_invoices
+	/// [`Bolt12Payment::send_payment_for_bolt12_invoice`]: crate::payment::Bolt12Payment::send_payment_for_bolt12_invoice
+	/// [`Bolt12Payment::abandon_bolt12_invoice`]: crate::payment::Bolt12Payment::abandon_bolt12_invoice
+	Bolt12InvoiceReceived {
+		/// A local identifier used to track the payment.
+		payment_id: PaymentId,
+		/// The hash of the payment as specified in the invoice.
+		payment_hash: PaymentHash,
+		/// The amount in millisatoshis specified in the invoice.
+		amount_msat: u64,
+	},
 }
 
 impl_writeable_tlv_based_enum!(Event,
@@ -594,6 +614,11 @@ impl_writeable_tlv_based_enum!(Event,
 		// TLV 7 (abandoned_funding_txo) may be set for LDK Node v0.7.
 		(9, reason, upgradable_option),
 		(11, parameters, upgradable_option),
+	},
+	(10, Bolt12InvoiceReceived) => {
+		(0, payment_id, required),
+		(2, payment_hash, required),
+		(4, amount_msat, required),
 	},
 );
 
@@ -768,6 +793,7 @@ where
 	logger: L,
 	config: Arc<Config>,
 	pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
+	pending_bolt12_invoice_contexts: PendingBolt12InvoiceContexts,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -786,6 +812,7 @@ where
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, prober: Option<Arc<Prober>>,
 		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 		pending_funding_fee_rates: Arc<Mutex<HashMap<u128, FeeRate>>>,
+		pending_bolt12_invoice_contexts: PendingBolt12InvoiceContexts,
 	) -> Self {
 		Self {
 			event_queue,
@@ -809,6 +836,7 @@ where
 			logger,
 			config,
 			pending_funding_fee_rates,
+			pending_bolt12_invoice_contexts,
 		}
 	}
 
@@ -2656,8 +2684,35 @@ where
 					)
 					.await;
 			},
-			LdkEvent::InvoiceReceived { .. } => {
-				debug_assert!(false, "We currently don't handle BOLT12 invoices manually, so this event should never be emitted.");
+			LdkEvent::InvoiceReceived { payment_id, invoice, context, .. } => {
+				let amount_msat = invoice.amount_msats();
+				let payment_hash = invoice.payment_hash();
+				log_info!(
+					self.logger,
+					"Received BOLT12 invoice for payment_id {} with amount {}msat for manual handling",
+					payment_id,
+					amount_msat,
+				);
+
+				self.pending_bolt12_invoice_contexts
+					.lock()
+					.unwrap()
+					.insert(payment_id, (invoice, context));
+
+				self.event_queue
+					.add_event(Event::Bolt12InvoiceReceived {
+						payment_id,
+						payment_hash,
+						amount_msat,
+					})
+					.await
+					.unwrap_or_else(|e| {
+						log_error!(
+							self.logger,
+							"Failed to push Bolt12InvoiceReceived event: {}",
+							e
+						);
+					});
 			},
 			LdkEvent::ConnectionNeeded { node_id, addresses } => {
 				let spawn_logger = self.logger.clone();
@@ -3362,6 +3417,7 @@ mod tests {
 			Arc::clone(&node.logger),
 			Arc::clone(&node.config),
 			Arc::clone(&node.pending_funding_fee_rates),
+			Arc::clone(&node.pending_bolt12_invoice_contexts),
 		);
 		(node, event_handler)
 	}
