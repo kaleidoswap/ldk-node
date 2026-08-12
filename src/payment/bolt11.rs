@@ -102,12 +102,14 @@ impl Bolt11Payment {
 	pub(crate) fn receive_inner(
 		&self, amount_msat: Option<u64>, invoice_description: &LdkBolt11InvoiceDescription,
 		expiry_secs: u32, manual_claim_payment_hash: Option<PaymentHash>,
+		min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<LdkBolt11Invoice, Error> {
 		let invoice_params = Bolt11InvoiceParameters {
 			amount_msats: amount_msat,
 			description: invoice_description.clone(),
 			invoice_expiry_delta_secs: Some(expiry_secs),
 			payment_hash: manual_claim_payment_hash,
+			min_final_cltv_expiry_delta,
 			..Default::default()
 		};
 
@@ -549,7 +551,8 @@ impl Bolt11Payment {
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_inner(Some(amount_msat), &description, expiry_secs, None)?;
+		let invoice =
+			self.receive_inner(Some(amount_msat), &description, expiry_secs, None, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -569,17 +572,29 @@ impl Bolt11Payment {
 	/// payment hash. If they're unable to obtain the preimage, they *MUST* immediately fail the
 	/// payment via [`fail_for_id`].
 	///
+	/// If set, `min_final_cltv_expiry_delta` pins the invoice's advertised final-hop CLTV expiry
+	/// delta (in blocks), overriding the default. It must be at least
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]; a small block buffer is added on top to allow for
+	/// confirmations during routing. This is useful for hold-invoice-style protocols where the
+	/// recipient needs a guaranteed lower bound on the inbound HTLC's expiry.
+	///
 	/// [`PaymentClaimable`]: crate::Event::PaymentClaimable
 	/// [`Config::manually_handle_unknown_bolt11_payments`]: crate::config::Config::manually_handle_unknown_bolt11_payments
 	/// [`claim_for_id`]: Self::claim_for_id
 	/// [`fail_for_id`]: Self::fail_for_id
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
 	pub fn receive_for_hash(
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
-		payment_hash: PaymentHash,
+		payment_hash: PaymentHash, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice =
-			self.receive_inner(Some(amount_msat), &description, expiry_secs, Some(payment_hash))?;
+		let invoice = self.receive_inner(
+			Some(amount_msat),
+			&description,
+			expiry_secs,
+			Some(payment_hash),
+			min_final_cltv_expiry_delta,
+		)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -591,7 +606,7 @@ impl Bolt11Payment {
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_inner(None, &description, expiry_secs, None)?;
+		let invoice = self.receive_inner(None, &description, expiry_secs, None, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 
@@ -611,15 +626,29 @@ impl Bolt11Payment {
 	/// payment hash. If they're unable to obtain the preimage, they *MUST* immediately fail the
 	/// payment via [`fail_for_id`].
 	///
+	/// If set, `min_final_cltv_expiry_delta` pins the invoice's advertised final-hop CLTV expiry
+	/// delta (in blocks), overriding the default. It must be at least
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]; a small block buffer is added on top to allow for
+	/// confirmations during routing. This is useful for hold-invoice-style protocols where the
+	/// recipient needs a guaranteed lower bound on the inbound HTLC's expiry.
+	///
 	/// [`PaymentClaimable`]: crate::Event::PaymentClaimable
 	/// [`Config::manually_handle_unknown_bolt11_payments`]: crate::config::Config::manually_handle_unknown_bolt11_payments
 	/// [`claim_for_id`]: Self::claim_for_id
 	/// [`fail_for_id`]: Self::fail_for_id
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
 	pub fn receive_variable_amount_for_hash(
 		&self, description: &Bolt11InvoiceDescription, expiry_secs: u32, payment_hash: PaymentHash,
+		min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_inner(None, &description, expiry_secs, Some(payment_hash))?;
+		let invoice = self.receive_inner(
+			None,
+			&description,
+			expiry_secs,
+			Some(payment_hash),
+			min_final_cltv_expiry_delta,
+		)?;
 		Ok(maybe_wrap(invoice))
 	}
 
