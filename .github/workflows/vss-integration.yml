@@ -34,6 +34,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: lightningdevkit/vss-server
+          # Pin the fixture layout/API expected by this signet-compatible node line.
+          ref: 935bbd200495c7439ffac6b5cf1f9135461a80a6
           path: vss-server
 
       - name: Build and Deploy VSS Server

@@ -566,7 +566,8 @@ impl Bolt11Payment {
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
-		let invoice = self.receive_inner(Some(amount_msat), &description, expiry_secs, None, None)?;
+		let invoice =
+			self.receive_inner(Some(amount_msat), &description, expiry_secs, None, None)?;
 		Ok(maybe_wrap(invoice))
 	}
 

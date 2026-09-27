@@ -113,6 +113,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(cycle_tests)]
 use std::{any::Any, sync::Weak};
 
+pub mod inventory;
+
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use bip39;
 pub use bitcoin;
