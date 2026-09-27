@@ -1651,7 +1651,7 @@ where
 
 				self.pending_bolt12_invoice_contexts
 					.lock()
-					.unwrap()
+					.expect("BOLT12 invoice context lock")
 					.insert(payment_id, (invoice, context));
 
 				self.event_queue
