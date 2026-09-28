@@ -85,6 +85,8 @@ pub struct InventoryChannel {
 	pub funding: Option<InventoryOutput>,
 	/// Pending conditional transfers.
 	pub htlcs: Vec<InventoryHtlc>,
+	/// Exact pre-fee holder allocation; includes unresolved outbound encumbrances.
+	pub accounting_balance_msat: Option<u64>,
 }
 
 /// Read-only InventoryCandidate evidence.
@@ -160,7 +162,7 @@ pub struct InventorySweep {
 /// Read-only FinancialInventory evidence.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FinancialInventory {
-	/// Version 1. Reject unsupported versions.
+	/// Schema 2 for simultaneous snapshots; schema 1 for fallback evidence.
 	pub schema_version: u32,
 	/// Node public key.
 	pub node_id: String,
@@ -186,17 +188,20 @@ pub struct FinancialInventory {
 	pub sweeps: Vec<InventorySweep>,
 	/// Explicit observation failures or changes. Empty does not imply atomicity.
 	pub gaps: Vec<String>,
-	/// Always false: component locks do not form a global snapshot.
+	/// True only when all financial component locks are held simultaneously.
 	pub atomic: bool,
+	/// Sanitized payment history captured under the same lock boundary (schema 2).
+	pub payments: Vec<InventoryPayment>,
 	/// Last successful on-chain sync, UNIX seconds.
 	pub latest_wallet_sync: Option<u64>,
 	/// Last successful Lightning sync, UNIX seconds.
 	pub latest_lightning_sync: Option<u64>,
 }
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use bitcoin::{OutPoint, TxOut};
 use lightning::chain::channelmonitor::Balance;
 use lightning::util::sweep::{OutputSpendStatus, TrackedSpendableOutput};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 impl InventoryOutput {
 	pub(crate) fn new(outpoint: OutPoint, output: &TxOut) -> Self {
@@ -351,50 +356,14 @@ impl crate::Node {
 	/// Each component is read independently. Missing monitors, changing evidence and stale
 	/// anchors are explicit gaps. Empty gaps do not establish accounting completeness.
 	/// This Rust API does not alter wallet, payment or channel state.
-	pub fn financial_inventory(&self) -> FinancialInventory {
+	fn uncoordinated_inventory(&self) -> FinancialInventory {
 		let started_at_ms = now_ms();
 		let status = self.status();
 		let node_tip_before = self.channel_manager.current_best_block().into();
 		let wallet = self.wallet.inventory();
 		let channels_before = self.channel_manager.list_channels();
-		let mut channels: Vec<_> = channels_before
-			.iter()
-			.map(|c| {
-				let mut htlcs: Vec<_> = c
-					.pending_inbound_htlcs
-					.iter()
-					.map(|h| InventoryHtlc {
-						inbound: true,
-						htlc_id: Some(h.htlc_id),
-						amount_msat: h.amount_msat,
-						payment_hash: h.payment_hash.to_string(),
-						cltv_expiry: h.cltv_expiry,
-						state: h.state.as_ref().map(|s| format!("{s:?}")),
-						is_dust: h.is_dust,
-						skimmed_fee_msat: None,
-					})
-					.collect();
-				htlcs.extend(c.pending_outbound_htlcs.iter().map(|h| InventoryHtlc {
-					inbound: false,
-					htlc_id: h.htlc_id,
-					amount_msat: h.amount_msat,
-					payment_hash: h.payment_hash.to_string(),
-					cltv_expiry: h.cltv_expiry,
-					state: h.state.as_ref().map(|s| format!("{s:?}")),
-					is_dust: h.is_dust,
-					skimmed_fee_msat: h.skimmed_fee_msat,
-				}));
-				InventoryChannel {
-					channel_id: c.channel_id.to_string(),
-					counterparty_node_id: c.counterparty.node_id.to_string(),
-					funding: c.funding_txo.and_then(|o| {
-						c.get_funding_output()
-							.map(|out| InventoryOutput::new(o.into_bitcoin_outpoint(), &out))
-					}),
-					htlcs,
-				}
-			})
-			.collect();
+		let mut channels: Vec<_> =
+			channels_before.iter().map(|c| project_channel(c, None)).collect();
 		channels.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
 		let mut gaps = Vec::new();
 		let mut monitor_ids = self.chain_monitor.list_monitors();
@@ -479,18 +448,193 @@ impl crate::Node {
 			sweeps,
 			gaps,
 			atomic: false,
+			payments: Vec::new(),
 			latest_wallet_sync: status.latest_onchain_wallet_sync_timestamp,
 			latest_lightning_sync: status.latest_lightning_wallet_sync_timestamp,
 		}
 	}
 }
 
+fn project_channel(
+	c: &lightning::ln::channel_state::ChannelDetails, accounting_balance_msat: Option<u64>,
+) -> InventoryChannel {
+	let mut htlcs: Vec<_> = c
+		.pending_inbound_htlcs
+		.iter()
+		.map(|h| InventoryHtlc {
+			inbound: true,
+			htlc_id: Some(h.htlc_id),
+			amount_msat: h.amount_msat,
+			payment_hash: h.payment_hash.to_string(),
+			cltv_expiry: h.cltv_expiry,
+			state: h.state.as_ref().map(|s| format!("{s:?}")),
+			is_dust: h.is_dust,
+			skimmed_fee_msat: None,
+		})
+		.collect();
+	htlcs.extend(c.pending_outbound_htlcs.iter().map(|h| InventoryHtlc {
+		inbound: false,
+		htlc_id: h.htlc_id,
+		amount_msat: h.amount_msat,
+		payment_hash: h.payment_hash.to_string(),
+		cltv_expiry: h.cltv_expiry,
+		state: h.state.as_ref().map(|s| format!("{s:?}")),
+		is_dust: h.is_dust,
+		skimmed_fee_msat: h.skimmed_fee_msat,
+	}));
+	InventoryChannel {
+		channel_id: c.channel_id.to_string(),
+		counterparty_node_id: c.counterparty.node_id.to_string(),
+		funding: c.funding_txo.and_then(|o| {
+			c.get_funding_output().map(|out| InventoryOutput::new(o.into_bitcoin_outpoint(), &out))
+		}),
+		htlcs,
+		accounting_balance_msat,
+	}
+}
+
+/// Sanitized payment accounting evidence. Never contains secrets or preimages.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InventoryPayment {
+	/// Stable node payment ID.
+	pub payment_id: String,
+	/// On-chain transaction ID, absent for Lightning.
+	pub txid: Option<String>,
+	/// Lightning payment hash, absent when not yet assigned or for on-chain.
+	pub payment_hash: Option<String>,
+	/// Whether value is received by this node.
+	pub inbound: bool,
+	/// pending, succeeded or failed.
+	pub status: String,
+	/// Actual amount, unknown remains absent.
+	pub amount_msat: Option<u64>,
+	/// Actual fee, unknown remains absent.
+	pub fee_msat: Option<u64>,
+	/// Last update in UNIX seconds.
+	pub updated_at: u64,
+}
+fn project_payment(p: crate::payment::PaymentDetails) -> InventoryPayment {
+	use crate::payment::{PaymentDirection, PaymentKind, PaymentStatus};
+	let (txid, payment_hash) = match p.kind {
+		PaymentKind::Onchain { txid, .. } => (Some(txid.to_string()), None),
+		PaymentKind::Bolt11 { hash, .. }
+		| PaymentKind::Bolt11Jit { hash, .. }
+		| PaymentKind::Spontaneous { hash, .. } => (None, Some(hash.to_string())),
+		PaymentKind::Bolt12Offer { hash, .. } | PaymentKind::Bolt12Refund { hash, .. } => {
+			(None, hash.map(|h| h.to_string()))
+		},
+	};
+	InventoryPayment {
+		payment_id: crate::hex_utils::to_string(&p.id.0),
+		txid,
+		payment_hash,
+		inbound: p.direction == PaymentDirection::Inbound,
+		status: match p.status {
+			PaymentStatus::Pending => "pending",
+			PaymentStatus::Succeeded => "succeeded",
+			PaymentStatus::Failed => "failed",
+		}
+		.into(),
+		amount_msat: p.amount_msat,
+		fee_msat: p.fee_paid_msat,
+		updated_at: p.latest_update_timestamp,
+	}
+}
+impl crate::Node {
+	/// Captures wallet, channels, monitors, sweeper and payments under one lock
+	/// boundary. Secondary locks are try-locks to avoid inversion with LDK writers.
+	/// Contention returns explicitly non-atomic evidence, never a guessed snapshot.
+	pub fn financial_inventory(&self) -> FinancialInventory {
+		let started_at_ms = now_ms();
+		let status = self.status();
+		let result = self.wallet.with_inventory(|wallet| {
+			self.channel_manager
+				.try_with_accounting_snapshot(|tip, channels| {
+					self.chain_monitor
+						.try_with_accounting_snapshot(|monitors| {
+							self.output_sweeper
+								.try_with_accounting_snapshot(|sweeper_tip, sweeps| {
+									self.payment_store.try_with_objects(|payments| {
+										let mut channels: Vec<_> = channels
+											.iter()
+											.map(|(c, balance)| project_channel(c, Some(*balance)))
+											.collect();
+										channels.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+										let mut monitors: Vec<_> = monitors
+											.into_iter()
+											.map(|(id, m)| {
+												let funding = m.get_funding_txo();
+												InventoryMonitor {
+													channel_id: id.to_string(),
+													funding_txid: funding.txid.to_string(),
+													funding_vout: u32::from(funding.index),
+													tip: m.current_best_block().into(),
+													claims: m
+														.get_claimable_balances()
+														.into_iter()
+														.map(claim)
+														.collect(),
+												}
+											})
+											.collect();
+										monitors.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+										let mut sweeps: Vec<_> =
+											sweeps.into_iter().map(sweep).collect();
+										sweeps.sort_by(|a, b| {
+											(&a.output.txid, a.output.vout)
+												.cmp(&(&b.output.txid, b.output.vout))
+										});
+										let mut payments: Vec<_> =
+											payments.into_iter().map(project_payment).collect();
+										payments.sort_by(|a, b| a.payment_id.cmp(&b.payment_id));
+										FinancialInventory {
+											schema_version: 2,
+											node_id: self.node_id().to_string(),
+											network: status.network.to_string(),
+											started_at_ms,
+											finished_at_ms: now_ms(),
+											node_tip_before: tip.into(),
+											node_tip_after: tip.into(),
+											wallet,
+											channels,
+											monitors,
+											sweeper_tip: sweeper_tip.into(),
+											sweeps,
+											payments,
+											atomic: true,
+											gaps: if status.is_running {
+												vec![]
+											} else {
+												vec!["node_not_running".into()]
+											},
+											latest_wallet_sync: status
+												.latest_onchain_wallet_sync_timestamp,
+											latest_lightning_sync: status
+												.latest_lightning_wallet_sync_timestamp,
+										}
+									})
+								})
+								.flatten()
+						})
+						.flatten()
+				})
+				.flatten()
+		});
+		result.unwrap_or_else(|| {
+			let mut inventory = self.uncoordinated_inventory();
+			inventory.gaps.push("accounting_snapshot_contended".into());
+			inventory
+		})
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use bitcoin::hashes::Hash;
 	use lightning::chain::channelmonitor::HolderCommitmentTransactionBalance;
 	use lightning_types::payment::{PaymentHash, PaymentPreimage};
+
+	use super::*;
 	#[test]
 	fn contentious_claim_never_exposes_preimage() {
 		let projected = claim(Balance::ContentiousClaimable {
@@ -573,7 +717,12 @@ mod tests {
 		assert!(first.wallet.utxos.is_empty());
 		assert_eq!(first.network, "regtest");
 		assert!(first.gaps.contains(&"node_not_running".to_owned()));
-		assert!(!first.atomic);
+		assert!(first.atomic);
+		assert_eq!(first.schema_version, 2);
+		let contended =
+			node.payment_store.try_with_objects(|_| node.financial_inventory()).unwrap();
+		assert!(!contended.atomic);
+		assert!(contended.gaps.contains(&"accounting_snapshot_contended".to_owned()));
 		assert!(first.finished_at_ms >= first.started_at_ms);
 		drop(node);
 		if dir.exists() {

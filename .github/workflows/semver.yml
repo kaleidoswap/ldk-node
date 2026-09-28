@@ -7,5 +7,24 @@ jobs:
     steps:
       - name: Checkout source code
         uses: actions/checkout@v6
+      # cargo-semver-checks creates a synthetic consumer workspace. Cargo does
+      # not inherit dependency manifests' patches, so supply the same root
+      # patches used by real consumers (including ldk-server) to that workspace.
+      - name: Preserve accounting dependency pins for synthetic consumers
+        shell: bash
+        run: |
+          python3 - <<'PYCONFIG'
+          import os
+          from pathlib import Path
+          import tomllib
+          manifest = Path("Cargo.toml").read_text()
+          header = '[patch."https://github.com/lightningdevkit/rust-lightning"]'
+          patch = header + manifest.split(header, 1)[1]
+          assert set(tomllib.loads(patch)) == {"patch"}
+          config = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))) / "config.toml"
+          config.parent.mkdir(parents=True, exist_ok=True)
+          with config.open("a") as output:
+              output.write("\n" + patch + "\n")
+          PYCONFIG
       - name: Check SemVer
         uses: obi1kenobi/cargo-semver-checks-action@v2

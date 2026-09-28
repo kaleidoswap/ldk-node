@@ -140,6 +140,11 @@ where
 		}
 	}
 
+	pub(crate) fn try_with_objects<R>(&self, f: impl FnOnce(Vec<SO>) -> R) -> Option<R> {
+		let objects = self.objects.try_lock().ok()?;
+		Some(f(objects.values().cloned().collect()))
+	}
+
 	pub(crate) fn list_filter<F: FnMut(&&SO) -> bool>(&self, f: F) -> Vec<SO> {
 		self.objects.lock().expect("lock").values().filter(f).cloned().collect::<Vec<SO>>()
 	}
