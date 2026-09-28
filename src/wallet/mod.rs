@@ -514,8 +514,15 @@ impl Wallet {
 	}
 
 	pub(crate) fn inventory(&self) -> crate::inventory::WalletInventory {
-		use crate::inventory::{InventoryOutput, InventoryTip, InventoryUtxo, WalletInventory};
+		self.with_inventory(|inventory| inventory)
+	}
+
+	pub(crate) fn with_inventory<R>(
+		&self, f: impl FnOnce(crate::inventory::WalletInventory) -> R,
+	) -> R {
 		use bdk_chain::ChainPosition;
+
+		use crate::inventory::{InventoryOutput, InventoryTip, InventoryUtxo, WalletInventory};
 		let wallet = self.inner.lock().expect("lock");
 		let tip = wallet.local_chain().tip().block_id();
 		let mut utxos: Vec<_> = wallet
@@ -545,10 +552,11 @@ impl Wallet {
 			})
 			.collect();
 		utxos.sort_by(|a, b| (&a.output.txid, a.output.vout).cmp(&(&b.output.txid, b.output.vout)));
-		WalletInventory {
+		let inventory = WalletInventory {
 			tip: InventoryTip { hash: tip.hash.to_string(), height: tip.height },
 			utxos,
-		}
+		};
+		f(inventory)
 	}
 
 	pub(crate) fn get_balances(
