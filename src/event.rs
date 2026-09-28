@@ -1098,6 +1098,18 @@ where
 					hex_utils::to_string(&payment_hash.0),
 					amount_msat,
 				);
+				// LDK knows the preimage of every BOLT12 invoice it derived itself, so a missing one
+				// means the offer or refund was created for an externally-chosen payment hash.
+				let is_bolt12_for_hash = purpose.preimage().is_none()
+					&& matches!(
+						purpose,
+						PaymentPurpose::Bolt12OfferPayment { .. }
+							| PaymentPurpose::Bolt12RefundPayment { .. }
+					);
+				let hold_custom_records = onion_fields
+					.as_ref()
+					.map(|cf| cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
+					.unwrap_or_default();
 				let payment_preimage = match purpose {
 					PaymentPurpose::Bolt11InvoicePayment {
 						payment_preimage,
@@ -1252,6 +1264,21 @@ where
 
 				if let Some(preimage) = payment_preimage {
 					self.channel_manager.claim_funds(preimage);
+				} else if is_bolt12_for_hash {
+					let event = Event::PaymentClaimable {
+						payment_id,
+						payment_hash,
+						claimable_amount_msat: amount_msat,
+						claim_deadline,
+						custom_records: hold_custom_records,
+					};
+					match self.event_queue.add_event(event).await {
+						Ok(_) => return Ok(()),
+						Err(e) => {
+							log_error!(self.logger, "Failed to push to event queue: {}", e);
+							return Err(ReplayEvent());
+						},
+					};
 				} else {
 					log_error!(
 						self.logger,

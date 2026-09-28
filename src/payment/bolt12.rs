@@ -26,7 +26,7 @@ use lightning::routing::router::RouteParametersConfig;
 use lightning::sign::{EntropySource, NodeSigner};
 #[cfg(feature = "uniffi")]
 use lightning::util::ser::{Readable, Writeable};
-use lightning_types::payment::PaymentPreimage;
+use lightning_types::payment::{PaymentHash, PaymentPreimage};
 use lightning_types::string::UntrustedString;
 
 use crate::config::{AsyncPaymentsRole, Config, LDK_PAYMENT_RETRY_TIMEOUT};
@@ -246,9 +246,16 @@ impl Bolt12Payment {
 	}
 
 	pub(crate) fn receive_inner(
-		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>, quantity: Option<u64>,
+		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>,
+		quantity: Option<u64>, payment_hash: Option<(PaymentHash, Option<u16>)>,
 	) -> Result<LdkOffer, Error> {
-		let mut offer_builder = self.channel_manager.create_offer_builder().map_err(|e| {
+		let offer_builder = match payment_hash {
+			Some((payment_hash, min_final_cltv_expiry_delta)) => self
+				.channel_manager
+				.create_offer_builder_for_payment_hash(payment_hash, min_final_cltv_expiry_delta),
+			None => self.channel_manager.create_offer_builder(),
+		};
+		let mut offer_builder = offer_builder.map_err(|e| {
 			log_error!(self.logger, "Failed to create offer builder: {:?}", e);
 			Error::OfferCreationFailed
 		})?;
@@ -520,7 +527,44 @@ impl Bolt12Payment {
 	pub fn receive(
 		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>, quantity: Option<u64>,
 	) -> Result<Offer, Error> {
-		let offer = self.receive_inner(amount_msat, description, expiry_secs, quantity)?;
+		let offer = self.receive_inner(amount_msat, description, expiry_secs, quantity, None)?;
+		Ok(maybe_wrap(offer))
+	}
+
+	/// Returns a payable offer that can be used to request and receive a payment of the amount
+	/// given for the given payment hash.
+	///
+	/// Every invoice sent in response to an invoice request for the offer commits to
+	/// `payment_hash`. We will emit a [`PaymentClaimable`] event once the inbound payment arrives.
+	///
+	/// **Warning:** it is the user's responsibility to never reuse the same payment hash. The offer
+	/// itself can be paid more than once, and all such payments share the hash.
+	///
+	/// **Note:** users *MUST* handle this event and claim the payment manually via
+	/// [`Bolt11Payment::claim_for_id`] as soon as they have obtained access to the preimage of the
+	/// given payment hash. If they're unable to obtain the preimage, they *MUST* immediately fail
+	/// the payment via [`Bolt11Payment::fail_for_id`].
+	///
+	/// If set, `min_final_cltv_expiry_delta` pins the invoices' final-hop CLTV expiry delta (in
+	/// blocks), as for [`Bolt11Payment::receive_for_hash`]. It must be at least
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`] minus a small block buffer.
+	///
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`]: lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA
+	/// [`Bolt11Payment::receive_for_hash`]: crate::payment::Bolt11Payment::receive_for_hash
+	/// [`PaymentClaimable`]: crate::Event::PaymentClaimable
+	/// [`Bolt11Payment::claim_for_id`]: crate::payment::Bolt11Payment::claim_for_id
+	/// [`Bolt11Payment::fail_for_id`]: crate::payment::Bolt11Payment::fail_for_id
+	pub fn receive_for_hash(
+		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>,
+		quantity: Option<u64>, payment_hash: PaymentHash, min_final_cltv_expiry_delta: Option<u16>,
+	) -> Result<Offer, Error> {
+		let offer = self.receive_inner(
+			amount_msat,
+			description,
+			expiry_secs,
+			quantity,
+			Some((payment_hash, min_final_cltv_expiry_delta)),
+		)?;
 		Ok(maybe_wrap(offer))
 	}
 
@@ -557,12 +601,41 @@ impl Bolt12Payment {
 	/// [`Refund`]: lightning::offers::refund::Refund
 	/// [`Bolt12Invoice`]: lightning::offers::invoice::Bolt12Invoice
 	pub fn request_refund_payment(&self, refund: &Refund) -> Result<Bolt12Invoice, Error> {
+		self.request_refund_payment_inner(refund, None, None)
+	}
+
+	/// Requests a refund payment for the given [`Refund`], committing to the given payment hash.
+	///
+	/// As with [`Self::receive_for_hash`], a [`PaymentClaimable`] event is emitted once the
+	/// payment arrives, and it *MUST* be claimed or failed manually. `min_final_cltv_expiry_delta`
+	/// behaves as for [`Self::receive_for_hash`].
+	///
+	/// [`Refund`]: lightning::offers::refund::Refund
+	/// [`PaymentClaimable`]: crate::Event::PaymentClaimable
+	pub fn request_refund_payment_for_hash(
+		&self, refund: &Refund, payment_hash: PaymentHash, min_final_cltv_expiry_delta: Option<u16>,
+	) -> Result<Bolt12Invoice, Error> {
+		self.request_refund_payment_inner(refund, Some(payment_hash), min_final_cltv_expiry_delta)
+	}
+
+	fn request_refund_payment_inner(
+		&self, refund: &Refund, payment_hash: Option<PaymentHash>,
+		min_final_cltv_expiry_delta: Option<u16>,
+	) -> Result<Bolt12Invoice, Error> {
 		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
 		}
 
 		let refund = maybe_deref(refund);
-		let invoice = self.channel_manager.request_refund_payment(&refund).map_err(|e| {
+		let invoice = match payment_hash {
+			Some(payment_hash) => self.channel_manager.request_refund_payment_for_hash(
+				&refund,
+				payment_hash,
+				min_final_cltv_expiry_delta,
+			),
+			None => self.channel_manager.request_refund_payment(&refund),
+		};
+		let invoice = invoice.map_err(|e| {
 			log_error!(self.logger, "Failed to request refund payment: {:?}", e);
 			Error::InvoiceRequestCreationFailed
 		})?;

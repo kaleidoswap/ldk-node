@@ -437,6 +437,8 @@ impl Bolt11Payment {
 
 		let payment_hash = match details.kind {
 			PaymentKind::Bolt11 { hash, .. } => hash,
+			PaymentKind::Bolt12Offer { hash: Some(hash), preimage: None, .. }
+			| PaymentKind::Bolt12Refund { hash: Some(hash), preimage: None, .. } => hash,
 			_ => {
 				log_error!(
 					self.logger,
@@ -503,6 +505,8 @@ impl Bolt11Payment {
 
 		let payment_hash = match details.kind {
 			PaymentKind::Bolt11 { hash, .. } => hash,
+			PaymentKind::Bolt12Offer { hash: Some(hash), preimage: None, .. }
+			| PaymentKind::Bolt12Refund { hash: Some(hash), preimage: None, .. } => hash,
 			_ => {
 				log_error!(
 					self.logger,

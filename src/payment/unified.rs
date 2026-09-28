@@ -138,7 +138,7 @@ impl UnifiedPayment {
 		let onchain_address = self.onchain_payment.new_address()?;
 
 		let bolt12_offer =
-			match self.bolt12_payment.receive_inner(amount_msats, description, None, None) {
+			match self.bolt12_payment.receive_inner(amount_msats, description, None, None, None) {
 				Ok(offer) => Some(maybe_wrap(offer)),
 				Err(e) => {
 					log_error!(self.logger, "Failed to create offer: {}", e);
