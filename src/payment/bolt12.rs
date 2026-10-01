@@ -248,6 +248,7 @@ impl Bolt12Payment {
 	pub(crate) fn receive_inner(
 		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>,
 		quantity: Option<u64>, payment_hash: Option<(PaymentHash, Option<u16>)>,
+		ssps_rails: Option<Vec<u8>>,
 	) -> Result<LdkOffer, Error> {
 		let offer_builder = match payment_hash {
 			Some((payment_hash, min_final_cltv_expiry_delta)) => self
@@ -280,6 +281,10 @@ impl Bolt12Payment {
 				))
 			};
 		};
+
+		if let Some(rails) = ssps_rails {
+			offer = offer.ssps_rails(rails);
+		}
 
 		let finalized_offer = offer.build().map_err(|e| {
 			log_error!(self.logger, "Failed to create offer: {:?}", e);
@@ -527,7 +532,8 @@ impl Bolt12Payment {
 	pub fn receive(
 		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>, quantity: Option<u64>,
 	) -> Result<Offer, Error> {
-		let offer = self.receive_inner(amount_msat, description, expiry_secs, quantity, None)?;
+		let offer =
+			self.receive_inner(amount_msat, description, expiry_secs, quantity, None, None)?;
 		Ok(maybe_wrap(offer))
 	}
 
@@ -564,6 +570,25 @@ impl Bolt12Payment {
 			expiry_secs,
 			quantity,
 			Some((payment_hash, min_final_cltv_expiry_delta)),
+			None,
+		)?;
+		Ok(maybe_wrap(offer))
+	}
+
+	/// Like [`Self::receive`], but the offer also carries the experimental `ssps_rails` record
+	/// (type 1000000385): the payment rails we accept, as UTF-8 JSON (e.g.
+	/// `["btc:signet","ln"]`). Payers that do not understand it see a normal offer.
+	pub fn receive_with_ssps_rails(
+		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>, quantity: Option<u64>,
+		ssps_rails: String,
+	) -> Result<Offer, Error> {
+		let offer = self.receive_inner(
+			amount_msat,
+			description,
+			expiry_secs,
+			quantity,
+			None,
+			Some(ssps_rails.into_bytes()),
 		)?;
 		Ok(maybe_wrap(offer))
 	}

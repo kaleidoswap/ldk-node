@@ -86,18 +86,18 @@ uniffi-default = [
 #lightning-macros = { version = "0.2.0" }
 #lightning-dns-resolver = { version = "0.3.0" }
 
-lightning = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["std"] }
-lightning-types = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-invoice = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["std"] }
-lightning-net-tokio = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-persister = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["tokio"], optional = true }
-lightning-background-processor = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-rapid-gossip-sync = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-block-sync = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["rest-client", "rpc-client", "tokio"], optional = true }
-lightning-transaction-sync = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", optional = true }
-lightning-liquidity = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["std"] }
-lightning-macros = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-dns-resolver = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", optional = true }
+lightning = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["std"] }
+lightning-types = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-invoice = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["std"] }
+lightning-net-tokio = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-persister = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["tokio"], optional = true }
+lightning-background-processor = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-rapid-gossip-sync = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-block-sync = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["rest-client", "rpc-client", "tokio"], optional = true }
+lightning-transaction-sync = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", optional = true }
+lightning-liquidity = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["std"] }
+lightning-macros = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-dns-resolver = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", optional = true }
 
 bdk_chain = { version = "0.23.3", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.22.2", default-features = false, features = ["async-https-rustls", "tokio"], optional = true }
@@ -138,8 +138,8 @@ bitcoin-payment-instructions = { git = "https://github.com/benthecarman/bitcoin-
 winapi = { version = "0.3", features = ["winbase"] }
 
 [dev-dependencies]
-lightning = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["std", "_test_utils"] }
-lightning-persister = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60", features = ["tokio"] }
+lightning = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["std", "_test_utils"] }
+lightning-persister = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2", features = ["tokio"] }
 rand = { version = "0.9.2", default-features = false, features = ["std", "thread_rng", "os_rng"] }
 proptest = "1.0.0"
 regex = "1.5.6"
@@ -248,8 +248,8 @@ harness = false
 
 # bitcoin-payment-instructions pins upstream rust-lightning; unify it on the fork.
 [patch."https://github.com/lightningdevkit/rust-lightning"]
-lightning = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-invoice = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-types = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-lightning-macros = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
-possiblyrandom = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "893ec7f6d78a471ba2272837e3735724e123de60" }
+lightning = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-invoice = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-types = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+lightning-macros = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
+possiblyrandom = { git = "https://github.com/kaleidoswap/rust-lightning", rev = "55583cc7a99162dab864d8bf52582c7abc8b6cc2" }
