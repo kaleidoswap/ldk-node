@@ -294,6 +294,32 @@ impl Bolt12Payment {
 		Ok(finalized_offer)
 	}
 
+	fn receive_variable_amount_inner(
+		&self, description: &str, expiry_secs: Option<u32>, ssps_rails: Option<Vec<u8>>,
+	) -> Result<LdkOffer, Error> {
+		let mut offer_builder = self.channel_manager.create_offer_builder().map_err(|e| {
+			log_error!(self.logger, "Failed to create offer builder: {:?}", e);
+			Error::OfferCreationFailed
+		})?;
+
+		if let Some(expiry_secs) = expiry_secs {
+			let absolute_expiry = (SystemTime::now() + Duration::from_secs(expiry_secs as u64))
+				.duration_since(UNIX_EPOCH)
+				.expect("system time must be after Unix epoch");
+			offer_builder = offer_builder.absolute_expiry(absolute_expiry);
+		}
+
+		let mut offer_builder = offer_builder.description(description.to_string());
+		if let Some(rails) = ssps_rails {
+			offer_builder = offer_builder.ssps_rails(rails);
+		}
+
+		offer_builder.build().map_err(|e| {
+			log_error!(self.logger, "Failed to create offer: {:?}", e);
+			Error::OfferCreationFailed
+		})
+	}
+
 	fn blinded_paths_for_async_recipient_internal(
 		&self, recipient_id: Vec<u8>,
 	) -> Result<Vec<BlindedMessagePath>, Error> {
@@ -579,8 +605,8 @@ impl Bolt12Payment {
 	/// (type 1000000385): the payment rails we accept, as UTF-8 JSON (e.g.
 	/// `["btc:signet","ln"]`). Payers that do not understand it see a normal offer.
 	pub fn receive_with_ssps_rails(
-		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>, quantity: Option<u64>,
-		ssps_rails: String,
+		&self, amount_msat: u64, description: &str, expiry_secs: Option<u32>,
+		quantity: Option<u64>, ssps_rails: String,
 	) -> Result<Offer, Error> {
 		let offer = self.receive_inner(
 			amount_msat,
@@ -598,23 +624,20 @@ impl Bolt12Payment {
 	pub fn receive_variable_amount(
 		&self, description: &str, expiry_secs: Option<u32>,
 	) -> Result<Offer, Error> {
-		let mut offer_builder = self.channel_manager.create_offer_builder().map_err(|e| {
-			log_error!(self.logger, "Failed to create offer builder: {:?}", e);
-			Error::OfferCreationFailed
-		})?;
+		let offer = self.receive_variable_amount_inner(description, expiry_secs, None)?;
+		Ok(maybe_wrap(offer))
+	}
 
-		if let Some(expiry_secs) = expiry_secs {
-			let absolute_expiry = (SystemTime::now() + Duration::from_secs(expiry_secs as u64))
-				.duration_since(UNIX_EPOCH)
-				.expect("system time must be after Unix epoch");
-			offer_builder = offer_builder.absolute_expiry(absolute_expiry);
-		}
-
-		let offer = offer_builder.description(description.to_string()).build().map_err(|e| {
-			log_error!(self.logger, "Failed to create offer: {:?}", e);
-			Error::OfferCreationFailed
-		})?;
-
+	/// Like [`Self::receive_variable_amount`], but the offer also carries the experimental
+	/// `ssps_rails` record (type 1000000385), as for [`Self::receive_with_ssps_rails`].
+	pub fn receive_variable_amount_with_ssps_rails(
+		&self, description: &str, expiry_secs: Option<u32>, ssps_rails: String,
+	) -> Result<Offer, Error> {
+		let offer = self.receive_variable_amount_inner(
+			description,
+			expiry_secs,
+			Some(ssps_rails.into_bytes()),
+		)?;
 		Ok(maybe_wrap(offer))
 	}
 
