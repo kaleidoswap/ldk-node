@@ -1119,6 +1119,7 @@ impl Node {
 		Bolt12Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.router),
 			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.config),
@@ -1137,6 +1138,7 @@ impl Node {
 		Arc::new(Bolt12Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.router),
 			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.config),
