@@ -7654,8 +7654,21 @@ async fn bolt12_manual_invoice_handling() {
 		ref e => panic!("Expected Bolt12InvoiceReceived, got: {:?}", e),
 	}
 
+	// The held invoice is routable within the default limits, but not within a CLTV budget
+	// smaller than its blinded paths need. Checking does not consume it.
+	assert_eq!(node_a.bolt12_payment().has_route_for_bolt12_invoice(payment_id, None), Ok(true));
+	let tight_cltv = RouteParametersConfig { max_total_cltv_expiry_delta: 1, ..Default::default() };
+	assert_eq!(
+		node_a.bolt12_payment().has_route_for_bolt12_invoice(payment_id, Some(tight_cltv)),
+		Ok(false)
+	);
+
 	// Now explicitly pay the invoice
 	node_a.bolt12_payment().send_payment_for_bolt12_invoice(payment_id).unwrap();
+	assert_eq!(
+		node_a.bolt12_payment().has_route_for_bolt12_invoice(payment_id, None),
+		Err(NodeError::InvalidPaymentId)
+	);
 
 	// Should now get PaymentSuccessful
 	expect_payment_successful_event!(node_a, payment_id, None);
