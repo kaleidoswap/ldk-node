@@ -1064,6 +1064,12 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		.receive(invoice_amount_1_msat, &invoice_description.clone().into(), 9217)
 		.unwrap();
 
+	assert_eq!(node_a.bolt11_payment().has_route(&invoice, None, None), Ok(true));
+	assert_eq!(
+		node_a.bolt11_payment().has_route(&invoice, Some(funding_amount_sat * 1000 * 2), None),
+		Ok(false)
+	);
+
 	println!("\nA send");
 	let payment_id = node_a.bolt11_payment().send(&invoice, None).unwrap();
 	assert_eq!(node_a.bolt11_payment().send(&invoice, None), Err(NodeError::DuplicatePayment));
