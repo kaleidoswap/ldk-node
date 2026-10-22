@@ -17,7 +17,9 @@ use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
 };
 use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
-use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+use lightning::routing::router::{
+	PaymentParameters, RouteParameters, RouteParametersConfig, Router as _,
+};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
 };
@@ -36,7 +38,7 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, PaymentStore, Router};
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -58,6 +60,7 @@ type Bolt11InvoiceDescription = crate::ffi::Bolt11InvoiceDescription;
 pub struct Bolt11Payment {
 	runtime: Arc<Runtime>,
 	channel_manager: Arc<ChannelManager>,
+	router: Arc<Router>,
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	payment_store: Arc<PaymentStore>,
@@ -69,7 +72,7 @@ pub struct Bolt11Payment {
 
 impl Bolt11Payment {
 	pub(crate) fn new(
-		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
+		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>, router: Arc<Router>,
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
@@ -78,6 +81,7 @@ impl Bolt11Payment {
 		Self {
 			runtime,
 			channel_manager,
+			router,
 			connection_manager,
 			liquidity_source,
 			payment_store,
@@ -785,6 +789,58 @@ impl Bolt11Payment {
 			Some(payment_hash),
 		)?;
 		Ok(maybe_wrap(invoice))
+	}
+
+	/// Returns whether a route that would pay the given invoice exists, without sending anything.
+	///
+	/// Runs the same pathfinding a payment would: over the network graph and the scorer, with
+	/// the invoice's route hints and this node's usable channels as first hops. No HTLC is sent,
+	/// so unlike [`Self::send_probes`] it commits no liquidity. A route found here can still fail
+	/// at payment time if a channel lacks the liquidity the graph suggests.
+	///
+	/// `amount_msat` must be set for a "zero-amount" invoice. If `route_parameters` are provided
+	/// they will override the default as well as the node-wide parameters configured via
+	/// [`Config::route_parameters`] on a per-field basis.
+	pub fn has_route(
+		&self, invoice: &Bolt11Invoice, amount_msat: Option<u64>,
+		route_parameters: Option<RouteParametersConfig>,
+	) -> Result<bool, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let invoice = maybe_deref(invoice);
+		let payment_params = PaymentParameters::from_bolt11_invoice(invoice);
+		let amount_msat = match (invoice.amount_milli_satoshis(), amount_msat) {
+			(Some(invoice_amount), Some(amount)) if amount < invoice_amount => {
+				return Err(Error::InvalidAmount)
+			},
+			(_, Some(amount)) => amount,
+			(Some(invoice_amount), None) => invoice_amount,
+			(None, None) => return Err(Error::InvalidInvoice),
+		};
+
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
+		if let Some(RouteParametersConfig {
+			max_total_routing_fee_msat,
+			max_total_cltv_expiry_delta,
+			max_path_count,
+			max_channel_saturation_power_of_half,
+		}) = route_parameters.as_ref().or(self.config.route_parameters.as_ref())
+		{
+			route_params.max_total_routing_fee_msat = *max_total_routing_fee_msat;
+			route_params.payment_params.max_total_cltv_expiry_delta = *max_total_cltv_expiry_delta;
+			route_params.payment_params.max_path_count = *max_path_count;
+			route_params.payment_params.max_channel_saturation_power_of_half =
+				*max_channel_saturation_power_of_half;
+		}
+
+		let payer = self.channel_manager.get_our_node_id();
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let first_hops = usable_channels.iter().collect::<Vec<_>>();
+		let inflight_htlcs = self.channel_manager.compute_inflight_htlcs();
+		Ok(self.router.find_route(&payer, &route_params, Some(&first_hops), inflight_htlcs).is_ok())
 	}
 
 	/// Sends payment probes over all paths of a route that would be used to pay the given invoice.
