@@ -2611,7 +2611,7 @@ fn build_with_store_internal(
 		liquidity_source,
 		kv_store,
 		logger,
-		_router: router,
+		router,
 		scorer,
 		peer_store,
 		payment_store,
