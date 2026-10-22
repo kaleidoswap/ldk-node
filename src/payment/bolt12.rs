@@ -15,11 +15,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lightning::blinded_path::message::{BlindedMessagePath, OffersContext};
+use lightning::blinded_path::{IntroductionNode, NodeIdLookUp};
 use lightning::ln::channelmanager::{OptionalOfferPaymentParams, PaymentId};
 use lightning::ln::outbound_payment::Retry;
 use lightning::offers::offer::{Amount, Offer as LdkOffer, OfferFromHrn, Quantity};
 use lightning::offers::parse::Bolt12SemanticError;
-use lightning::routing::router::RouteParametersConfig;
+use lightning::routing::router::{
+	PaymentParameters, RouteParameters, RouteParametersConfig, Router as _,
+};
 use lightning::sign::EntropySource;
 #[cfg(feature = "uniffi")]
 use lightning::util::ser::{Readable, Writeable};
@@ -30,7 +33,7 @@ use crate::error::Error;
 use crate::ffi::{maybe_deref, maybe_wrap};
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::payment::store::{PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus};
-use crate::types::{ChannelManager, KeysManager, PaymentStore};
+use crate::types::{ChannelManager, KeysManager, PaymentStore, Router};
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt12Invoice = lightning::offers::invoice::Bolt12Invoice;
@@ -69,6 +72,7 @@ pub(crate) type PendingBolt12InvoiceContexts = Arc<
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Bolt12Payment {
 	channel_manager: Arc<ChannelManager>,
+	router: Arc<Router>,
 	keys_manager: Arc<KeysManager>,
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
@@ -80,13 +84,14 @@ pub struct Bolt12Payment {
 
 impl Bolt12Payment {
 	pub(crate) fn new(
-		channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
+		channel_manager: Arc<ChannelManager>, router: Arc<Router>, keys_manager: Arc<KeysManager>,
 		payment_store: Arc<PaymentStore>, config: Arc<Config>, is_running: Arc<RwLock<bool>>,
 		logger: Arc<Logger>, async_payments_role: Option<AsyncPaymentsRole>,
 		pending_bolt12_invoice_contexts: PendingBolt12InvoiceContexts,
 	) -> Self {
 		Self {
 			channel_manager,
+			router,
 			keys_manager,
 			payment_store,
 			config,
@@ -559,6 +564,89 @@ impl Bolt12Payment {
 			.get_async_receive_offer()
 			.map(maybe_wrap)
 			.or(Err(Error::OfferCreationFailed))
+	}
+
+	/// Returns whether a route that would pay a BOLT12 invoice previously received via an
+	/// [`Event::Bolt12InvoiceReceived`] event exists, without sending anything.
+	///
+	/// Runs the same pathfinding [`Self::send_payment_for_bolt12_invoice`] would: over the
+	/// network graph and the scorer, to the invoice's blinded payment paths, with this node's
+	/// usable channels as first hops. No HTLC is sent, so it commits no liquidity, and the
+	/// invoice stays pending. A route found here can still fail at payment time if a channel
+	/// lacks the liquidity the graph suggests.
+	///
+	/// If `route_parameters` are provided they will override the default as well as the
+	/// node-wide parameters configured via [`Config::route_parameters`] on a per-field basis.
+	///
+	/// This is only relevant when [`Config::manually_handle_bolt12_invoices`] is set to `true`.
+	/// Returns an [`Error::InvalidPaymentId`] if no pending invoice is found for the given
+	/// `payment_id`.
+	///
+	/// [`Event::Bolt12InvoiceReceived`]: crate::Event::Bolt12InvoiceReceived
+	/// [`Config::route_parameters`]: crate::config::Config::route_parameters
+	/// [`Config::manually_handle_bolt12_invoices`]: crate::config::Config::manually_handle_bolt12_invoices
+	pub fn has_route_for_bolt12_invoice(
+		&self, payment_id: PaymentId, route_parameters: Option<RouteParametersConfig>,
+	) -> Result<bool, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let invoice = self
+			.pending_bolt12_invoice_contexts
+			.lock()
+			.expect("BOLT12 invoice context lock")
+			.get(&payment_id)
+			.map(|(invoice, _)| invoice.clone())
+			.ok_or(Error::InvalidPaymentId)?;
+
+		// Like a payment, skip past any blinded path whose introduction node is this node: the
+		// router cannot route from us to ourselves.
+		let our_node_id = self.channel_manager.get_our_node_id();
+		let secp_ctx = bitcoin::secp256k1::Secp256k1::new();
+		let mut payment_paths = invoice.payment_paths().to_vec();
+		for path in payment_paths.iter_mut() {
+			let introduction_node_id = match path.introduction_node() {
+				IntroductionNode::NodeId(pubkey) => *pubkey,
+				IntroductionNode::DirectedShortChannelId(direction, scid) => {
+					match self.channel_manager.next_node_id(*scid) {
+						Some(next_node_id) => *direction.select_pubkey(&our_node_id, &next_node_id),
+						None => continue,
+					}
+				},
+			};
+			if introduction_node_id == our_node_id {
+				let _ = path.advance_path_by_one(
+					&*self.keys_manager,
+					&*self.channel_manager,
+					&secp_ctx,
+				);
+			}
+		}
+
+		let config = route_parameters.or(self.config.route_parameters).unwrap_or_default();
+		let payment_params = PaymentParameters::blinded(payment_paths)
+			.with_bolt12_features(invoice.invoice_features().clone())
+			.map_err(|()| Error::InvalidInvoice)?
+			.with_expiry_time(
+				invoice.created_at().as_secs().saturating_add(invoice.relative_expiry().as_secs()),
+			)
+			.with_max_total_cltv_expiry_delta(config.max_total_cltv_expiry_delta)
+			.with_max_path_count(config.max_path_count)
+			.with_max_channel_saturation_power_of_half(config.max_channel_saturation_power_of_half);
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, invoice.amount_msats());
+		if let Some(max_fee_msat) = config.max_total_routing_fee_msat {
+			route_params.max_total_routing_fee_msat = Some(max_fee_msat);
+		}
+
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let first_hops = usable_channels.iter().collect::<Vec<_>>();
+		let inflight_htlcs = self.channel_manager.compute_inflight_htlcs();
+		Ok(self
+			.router
+			.find_route(&our_node_id, &route_params, Some(&first_hops), inflight_htlcs)
+			.is_ok())
 	}
 }
 
