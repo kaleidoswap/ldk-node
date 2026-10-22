@@ -924,6 +924,7 @@ impl Node {
 	pub fn bolt12_payment(&self) -> Bolt12Payment {
 		Bolt12Payment::new(
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.router),
 			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.config),
@@ -941,6 +942,7 @@ impl Node {
 	pub fn bolt12_payment(&self) -> Arc<Bolt12Payment> {
 		Arc::new(Bolt12Payment::new(
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.router),
 			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.config),
