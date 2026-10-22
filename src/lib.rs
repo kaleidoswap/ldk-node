@@ -276,7 +276,7 @@ pub struct Node {
 	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
-	_router: Arc<Router>,
+	router: Arc<Router>,
 	scorer: Arc<Mutex<Scorer>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
@@ -1076,6 +1076,7 @@ impl Node {
 		Bolt11Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.router),
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
@@ -1094,6 +1095,7 @@ impl Node {
 		Arc::new(Bolt11Payment::new(
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.router),
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
