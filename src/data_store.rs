@@ -729,6 +729,14 @@ where
 		self.persist_encoded(store_key, data).await
 	}
 
+	/// Runs `f` over the cached objects without waiting for the cache lock. The flag passed to
+	/// `f` is whether those objects are the whole namespace: a bounded cache never is, since it
+	/// is seeded with the newest objects only and evicts the least recently used.
+	pub(crate) fn try_with_objects<R>(&self, f: impl FnOnce(Vec<SO>, bool) -> R) -> Option<R> {
+		let cache = self.cache.try_lock().ok()?;
+		Some(f(cache.filter(|_| true), cache.is_keep_all()))
+	}
+
 	fn encode_object(object: &SO) -> (String, Vec<u8>) {
 		(object.id().encode_to_hex_str(), object.encode())
 	}
