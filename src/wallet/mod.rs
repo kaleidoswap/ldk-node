@@ -1971,6 +1971,52 @@ impl Wallet {
 		Ok(())
 	}
 
+	pub(crate) fn inventory(&self) -> crate::inventory::WalletInventory {
+		self.with_inventory(|inventory| inventory)
+	}
+
+	pub(crate) fn with_inventory<R>(
+		&self, f: impl FnOnce(crate::inventory::WalletInventory) -> R,
+	) -> R {
+		use bdk_chain::ChainPosition;
+
+		use crate::inventory::{InventoryOutput, InventoryTip, InventoryUtxo, WalletInventory};
+		let wallet = self.inner.lock().expect("lock");
+		let tip = wallet.local_chain().tip().block_id();
+		let mut utxos: Vec<_> = wallet
+			.list_unspent()
+			.map(|u| {
+				let (confirmation, transitively, first_seen, last_seen) = match u.chain_position {
+					ChainPosition::Confirmed { anchor, transitively } => (
+						Some(InventoryTip {
+							hash: anchor.block_id.hash.to_string(),
+							height: anchor.block_id.height,
+						}),
+						transitively.map(|t| t.to_string()),
+						None,
+						None,
+					),
+					ChainPosition::Unconfirmed { first_seen, last_seen } => {
+						(None, None, first_seen, last_seen)
+					},
+				};
+				InventoryUtxo {
+					output: InventoryOutput::new(u.outpoint, &u.txout),
+					confirmation,
+					transitively,
+					first_seen,
+					last_seen,
+				}
+			})
+			.collect();
+		utxos.sort_by(|a, b| (&a.output.txid, a.output.vout).cmp(&(&b.output.txid, b.output.vout)));
+		let inventory = WalletInventory {
+			tip: InventoryTip { hash: tip.hash.to_string(), height: tip.height },
+			utxos,
+		};
+		f(inventory)
+	}
+
 	fn cancel_tx_inner(
 		locked_wallet: &mut PersistedWallet<KVStoreWalletPersister>, tx: Transaction,
 	) {
@@ -10439,5 +10485,55 @@ mod tests {
 			"unexpected kind {:?}",
 			payment.kind,
 		);
+	}
+}
+
+#[cfg(test)]
+mod inventory_tests {
+	use super::*;
+	#[test]
+	fn inventory_tracks_unconfirmed_outpoints_without_mutating_wallet() {
+		let suffix =
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let dir = std::env::temp_dir().join(format!("ldk-wallet-inventory-{suffix}"));
+		let config = crate::config::Config {
+			network: bitcoin::Network::Regtest,
+			storage_dir_path: dir.to_string_lossy().into_owned(),
+			..Default::default()
+		};
+		let builder = crate::Builder::from_config(config);
+		#[cfg(not(feature = "uniffi"))]
+		let entropy = crate::entropy::NodeEntropy::from_seed_bytes([42; 64]);
+		#[cfg(feature = "uniffi")]
+		let entropy = crate::entropy::NodeEntropy::from_seed_bytes(vec![42; 64]).unwrap();
+		let node = builder.build(entropy.into()).unwrap();
+		let txid;
+		{
+			let mut wallet = node.wallet.inner.lock().unwrap();
+			let script = wallet.reveal_next_address(KeychainKind::External).address.script_pubkey();
+			let tx = Transaction {
+				version: bitcoin::transaction::Version::TWO,
+				lock_time: LockTime::ZERO,
+				input: vec![bitcoin::TxIn {
+					previous_output: OutPoint { txid: Txid::from_byte_array([7; 32]), vout: 0 },
+					..Default::default()
+				}],
+				output: vec![TxOut { value: Amount::from_sat(12345), script_pubkey: script }],
+			};
+			txid = tx.compute_txid();
+			wallet.apply_unconfirmed_txs([(tx, 123)]);
+		}
+		let first = node.wallet.inventory();
+		assert_eq!(first, node.wallet.inventory());
+		assert_eq!(first.utxos.len(), 1);
+		let observed = &first.utxos[0];
+		assert_eq!(observed.output.txid, txid.to_string());
+		assert_eq!(observed.output.value_sat, 12345);
+		assert_eq!(observed.confirmation, None);
+		assert_eq!(observed.last_seen, Some(123));
+		drop(node);
+		if dir.exists() {
+			std::fs::remove_dir_all(dir).unwrap();
+		}
 	}
 }
