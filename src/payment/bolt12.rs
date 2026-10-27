@@ -733,7 +733,7 @@ impl Bolt12Payment {
 		let (invoice, context) = self
 			.pending_bolt12_invoice_contexts
 			.lock()
-			.unwrap()
+			.expect("BOLT12 invoice context lock")
 			.remove(&payment_id)
 			.ok_or(Error::InvalidPaymentId)?;
 
@@ -769,7 +769,7 @@ impl Bolt12Payment {
 		let _removed = self
 			.pending_bolt12_invoice_contexts
 			.lock()
-			.unwrap()
+			.expect("BOLT12 invoice context lock")
 			.remove(&payment_id)
 			.ok_or(Error::InvalidPaymentId)?;
 
@@ -838,7 +838,7 @@ impl Bolt12Payment {
 		let (invoice, context) = self
 			.pending_bolt12_invoice_contexts
 			.lock()
-			.unwrap()
+			.expect("BOLT12 invoice context lock")
 			.remove(&payment_id)
 			.ok_or(Error::InvalidPaymentId)?;
 
@@ -874,7 +874,7 @@ impl Bolt12Payment {
 		let _removed = self
 			.pending_bolt12_invoice_contexts
 			.lock()
-			.unwrap()
+			.expect("BOLT12 invoice context lock")
 			.remove(&payment_id)
 			.ok_or(Error::InvalidPaymentId)?;
 
