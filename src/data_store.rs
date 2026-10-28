@@ -10,6 +10,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lightning::io::ErrorKind;
@@ -307,6 +308,7 @@ where
 	//
 	// Note the `cache` lock is always taken *inside* this one, and never held across an `.await`.
 	mutation_lock: tokio::sync::RwLock<()>,
+	mutation_revision: AtomicU64,
 	primary_namespace: String,
 	secondary_namespace: String,
 	kv_store: Arc<DynStore>,
@@ -335,6 +337,7 @@ where
 		Self {
 			cache,
 			mutation_lock: tokio::sync::RwLock::new(()),
+			mutation_revision: AtomicU64::new(0),
 			primary_namespace,
 			secondary_namespace,
 			kv_store,
@@ -346,6 +349,7 @@ where
 	/// Stores `object`, overwriting any object previously stored under the same id.
 	pub(crate) async fn insert(&self, object: SO) -> Result<(), Error> {
 		let _guard = self.mutation_lock.write().await;
+		self.mutation_revision.fetch_add(1, Ordering::SeqCst);
 
 		let id = object.id();
 		self.persist(&object).await?;
@@ -356,6 +360,7 @@ where
 	/// Removes the object stored under `id`, if any.
 	pub(crate) async fn remove(&self, id: &SO::Id) -> Result<(), Error> {
 		let _guard = self.mutation_lock.write().await;
+		self.mutation_revision.fetch_add(1, Ordering::SeqCst);
 
 		let known_absent = {
 			let cache = self.cache.lock().expect("lock");
@@ -397,6 +402,7 @@ where
 		&self, id: &SO::Id, predicate: F,
 	) -> Result<bool, Error> {
 		let _guard = self.mutation_lock.write().await;
+		self.mutation_revision.fetch_add(1, Ordering::SeqCst);
 
 		match self.lookup(id).await? {
 			Some(object) if predicate(&object) => {},
@@ -457,6 +463,7 @@ where
 		Fut: Future<Output = Result<Option<SO>, Error>>,
 	{
 		let _guard = self.mutation_lock.write().await;
+		self.mutation_revision.fetch_add(1, Ordering::SeqCst);
 
 		let current = self.lookup(id).await?;
 		let new_object = match f(current).await? {
@@ -543,6 +550,59 @@ where
 			objects: objects.into_iter().flatten().collect(),
 			next_page_token: response.next_page_token,
 		})
+	}
+
+	/// A bounded, revision-fenced durable namespace read. Never expand the LRU.
+	/// Writers are not held back during I/O; concurrent mutations invalidate it.
+	/// The caller must bound elapsed time. No other component locks may be held.
+	pub(crate) async fn durable_snapshot(&self, limit: usize) -> Result<(u64, Vec<SO>), Error> {
+		let revision = {
+			let _guard = self.mutation_lock.read().await;
+			self.mutation_revision.load(Ordering::SeqCst)
+		};
+		let mut token = None;
+		let mut seen = std::collections::BTreeSet::new();
+		let mut all = Vec::new();
+		for _ in 0..100 {
+			let page = self.list_keys_page(token).await?;
+			if all.len().saturating_add(page.keys.len()) > limit {
+				return Err(Error::PersistenceFailed);
+			}
+			for key in &page.keys {
+				if !seen.insert(key.clone()) {
+					return Err(Error::PersistenceFailed);
+				}
+			}
+			let mut objects = vec![None; page.keys.len()];
+			self.read_missing(&mut objects, page.keys.iter().cloned().enumerate().collect())
+				.await?;
+			for (key, object) in page.keys.iter().zip(objects) {
+				let object = object.ok_or(Error::PersistenceFailed)?;
+				if object.id().encode_to_hex_str() != *key {
+					return Err(Error::PersistenceFailed);
+				}
+				all.push(object);
+			}
+			match page.next_page_token {
+				Some(next) => token = Some(next),
+				None => {
+					return self
+						.try_with_revision(revision, || (revision, all))
+						.ok_or(Error::PersistenceFailed)
+				},
+			}
+		}
+		Err(Error::PersistenceFailed)
+	}
+
+	/// Revalidate a durable scan inside the coordinated component snapshot.
+	/// Try-locking avoids inversion with a writer that owns another component.
+	pub(crate) fn try_with_revision<R>(&self, revision: u64, f: impl FnOnce() -> R) -> Option<R> {
+		let _guard = self.mutation_lock.try_read().ok()?;
+		if self.mutation_revision.load(Ordering::SeqCst) != revision {
+			return None;
+		}
+		Some(f())
 	}
 
 	async fn list_keys_page(
@@ -785,6 +845,7 @@ where
 	/// Returns whether anything was written.
 	pub(crate) async fn insert_or_update(&self, object: SO) -> Result<bool, Error> {
 		let _guard = self.mutation_lock.write().await;
+		self.mutation_revision.fetch_add(1, Ordering::SeqCst);
 
 		let id = object.id();
 		// Note we have to look through to the store here: merging against a cache miss would
@@ -809,6 +870,7 @@ where
 	/// Applies `update` to the object stored under its id.
 	pub(crate) async fn update(&self, update: SO::Update) -> Result<DataStoreUpdateResult, Error> {
 		let _guard = self.mutation_lock.write().await;
+		self.mutation_revision.fetch_add(1, Ordering::SeqCst);
 
 		let id = update.id();
 		let Some(mut updated_object) = self.lookup(&id).await? else {
@@ -2102,6 +2164,24 @@ mod tests {
 				object.id
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn durable_snapshot_is_complete_bounded_and_revision_fenced() {
+		let store = new_data_store(in_memory_store(), keep_lru(2), Vec::new());
+		let inserted = insert_ascending(&store, 2 * IN_MEMORY_PAGE_SIZE + 25).await;
+		let (revision, objects) = store.durable_snapshot(inserted.len()).await.unwrap();
+		assert_eq!(objects.len(), inserted.len());
+		assert_eq!(store.cached_len(), 2);
+		assert!(store.try_with_revision(revision, || true).unwrap());
+		assert!(store.durable_snapshot(inserted.len() - 1).await.is_err());
+		store.remove(&inserted[0].id).await.unwrap();
+		assert!(store.try_with_revision(revision, || true).is_none());
+		let (current, _) = store.durable_snapshot(inserted.len()).await.unwrap();
+		let held = store.mutation_lock.write().await;
+		assert!(store.try_with_revision(current, || true).is_none());
+		drop(held);
+		assert!(store.try_with_revision(current, || true).unwrap());
 	}
 
 	#[tokio::test]
