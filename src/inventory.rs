@@ -545,6 +545,31 @@ impl crate::Node {
 	/// boundary. Secondary locks are try-locks to avoid inversion with LDK writers.
 	/// Contention returns explicitly non-atomic evidence, never a guessed snapshot.
 	pub fn financial_inventory(&self) -> FinancialInventory {
+		self.financial_inventory_with_durable(None)
+	}
+
+	/// Complete durable payment history, bounded to 10,000 records and five seconds.
+	/// A mutation after the scan invalidates the coordinated snapshot. Failure
+	/// retains explicit incomplete evidence, never certifies an LRU cache as full.
+	pub async fn financial_inventory_durable(&self) -> FinancialInventory {
+		match tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			self.payment_store.durable_snapshot(10_000),
+		)
+		.await
+		{
+			Ok(Ok(snapshot)) => self.financial_inventory_with_durable(Some(snapshot)),
+			_ => {
+				let mut inventory = self.financial_inventory();
+				inventory.gaps.push("payment_history_snapshot_unavailable".into());
+				inventory
+			},
+		}
+	}
+
+	fn financial_inventory_with_durable(
+		&self, durable: Option<(u64, Vec<crate::payment::PaymentDetails>)>,
+	) -> FinancialInventory {
 		let started_at_ms = now_ms();
 		let status = self.status();
 		let result = self.wallet.with_inventory(|wallet| {
@@ -554,79 +579,81 @@ impl crate::Node {
 						.try_with_accounting_snapshot(|monitors| {
 							self.output_sweeper
 								.try_with_accounting_snapshot(|sweeper_tip, sweeps| {
-									self.payment_store.try_with_objects(
-										|payments, payments_complete| {
-											let mut channels: Vec<_> = channels
-												.iter()
-												.map(|(c, balance)| {
-													project_channel(c, Some(*balance))
-												})
-												.collect();
-											channels
-												.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
-											let mut monitors: Vec<_> = monitors
-												.into_iter()
-												.map(|(id, m)| {
-													let funding = m.get_funding_txo();
-													InventoryMonitor {
-														channel_id: id.to_string(),
-														funding_txid: funding.txid.to_string(),
-														funding_vout: u32::from(funding.index),
-														tip: m.current_best_block().into(),
-														claims: m
-															.get_claimable_balances()
-															.into_iter()
-															.map(claim)
-															.collect(),
-													}
-												})
-												.collect();
-											monitors
-												.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
-											let mut sweeps: Vec<_> =
-												sweeps.into_iter().map(sweep).collect();
-											sweeps.sort_by(|a, b| {
-												(&a.output.txid, a.output.vout)
-													.cmp(&(&b.output.txid, b.output.vout))
-											});
-											let mut payments: Vec<_> =
-												payments.into_iter().map(project_payment).collect();
-											payments
-												.sort_by(|a, b| a.payment_id.cmp(&b.payment_id));
-											FinancialInventory {
-												schema_version: 2,
-												node_id: self.node_id().to_string(),
-												network: status.network.to_string(),
-												started_at_ms,
-												finished_at_ms: now_ms(),
-												node_tip_before: tip.into(),
-												node_tip_after: tip.into(),
-												wallet,
-												channels,
-												monitors,
-												sweeper_tip: sweeper_tip.into(),
-												sweeps,
-												payments,
-												atomic: true,
-												gaps: {
-													let mut gaps = Vec::new();
-													if !status.is_running {
-														gaps.push("node_not_running".into());
-													}
-													if !payments_complete {
-														gaps.push(
-															"payment_history_cached_only".into(),
-														);
-													}
-													gaps
-												},
-												latest_wallet_sync: status
-													.latest_onchain_wallet_sync_timestamp,
-												latest_lightning_sync: status
-													.latest_lightning_wallet_sync_timestamp,
-											}
+									let project = |payments: Vec<
+										crate::payment::PaymentDetails,
+									>,
+									               payments_complete: bool| {
+										let mut channels: Vec<_> = channels
+											.iter()
+											.map(|(c, balance)| project_channel(c, Some(*balance)))
+											.collect();
+										channels.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+										let mut monitors: Vec<_> = monitors
+											.into_iter()
+											.map(|(id, m)| {
+												let funding = m.get_funding_txo();
+												InventoryMonitor {
+													channel_id: id.to_string(),
+													funding_txid: funding.txid.to_string(),
+													funding_vout: u32::from(funding.index),
+													tip: m.current_best_block().into(),
+													claims: m
+														.get_claimable_balances()
+														.into_iter()
+														.map(claim)
+														.collect(),
+												}
+											})
+											.collect();
+										monitors.sort_by(|a, b| a.channel_id.cmp(&b.channel_id));
+										let mut sweeps: Vec<_> =
+											sweeps.into_iter().map(sweep).collect();
+										sweeps.sort_by(|a, b| {
+											(&a.output.txid, a.output.vout)
+												.cmp(&(&b.output.txid, b.output.vout))
+										});
+										let mut payments: Vec<_> =
+											payments.into_iter().map(project_payment).collect();
+										payments.sort_by(|a, b| a.payment_id.cmp(&b.payment_id));
+										FinancialInventory {
+											schema_version: 2,
+											node_id: self.node_id().to_string(),
+											network: status.network.to_string(),
+											started_at_ms,
+											finished_at_ms: now_ms(),
+											node_tip_before: tip.into(),
+											node_tip_after: tip.into(),
+											wallet,
+											channels,
+											monitors,
+											sweeper_tip: sweeper_tip.into(),
+											sweeps,
+											payments,
+											atomic: true,
+											gaps: {
+												let mut gaps = Vec::new();
+												if !status.is_running {
+													gaps.push("node_not_running".into());
+												}
+												if !payments_complete {
+													gaps.push("payment_history_cached_only".into());
+												}
+												gaps
+											},
+											latest_wallet_sync: status
+												.latest_onchain_wallet_sync_timestamp,
+											latest_lightning_sync: status
+												.latest_lightning_wallet_sync_timestamp,
+										}
+									};
+									match durable {
+										Some((revision, payments)) => {
+											self.payment_store.try_with_revision(revision, || {
+												project(payments, true)
+											})
 										},
-									)
+										None => self.payment_store.try_with_objects(project),
+									}
 								})
 								.flatten()
 						})
