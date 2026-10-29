@@ -2238,6 +2238,20 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn durable_snapshot_rejects_missing_records_and_storage_failure() {
+		let kv_store: Arc<DynStore> = Arc::new(DynStoreWrapper(PhantomKeyStore {
+			inner: InMemoryStore::new(),
+			phantom_key: test_id(200).encode_to_hex_str(),
+		}));
+		let store = new_data_store(kv_store, keep_lru(1), Vec::new());
+		insert_ascending(&store, 3).await;
+		assert!(store.durable_snapshot(10).await.is_err());
+		let failing =
+			new_data_store(Arc::new(DynStoreWrapper(FailingStore)), KeepAllEntries, Vec::new());
+		assert!(failing.durable_snapshot(10).await.is_err());
+	}
+
+	#[tokio::test]
 	async fn list_page_reports_failures() {
 		let failing =
 			new_data_store(Arc::new(DynStoreWrapper(FailingStore)), KeepAllEntries, Vec::new());
