@@ -577,15 +577,16 @@ impl ChainSource {
 					return;
 				}
 				Some(next_package) = receiver.recv() => {
-					// Classify funding broadcasts into payment records before sending. If
-					// classification fails we skip the broadcast, since broadcasting a tx we
-					// failed to record would leave it on-chain without a payment.
+					// Classify funding broadcasts into payment records and prepare the wallet's own
+					// sends before sending. If either fails we skip the broadcast: broadcasting a
+					// tx we failed to record would leave it on-chain without a payment, and a send
+					// the wallet refused would race the spend that now owns its inputs.
 					let package = match self.tx_broadcaster.classify_package(next_package).await {
 						Ok(package) => package,
 						Err(e) => {
 							log_error!(
 								tx_bcast_logger,
-								"Skipping broadcast: failed to persist payment records: {:?}",
+								"Skipping broadcast: failed to prepare transaction: {:?}",
 								e,
 							);
 							continue;
