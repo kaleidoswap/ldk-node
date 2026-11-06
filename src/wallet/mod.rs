@@ -111,6 +111,10 @@ pub(crate) const DUST_LIMIT_SATS: u64 = 546;
 /// margin while still releasing the inputs of a transaction that genuinely never propagated.
 pub(crate) const RECENT_TX_EVICTION_GRACE_SECS: u64 = 300;
 
+/// How long after we first saw one of our own sends an evicted copy of it is still reapplied
+/// and rebroadcast. See `Wallet::prepare_rebroadcast`.
+pub(crate) const EVICTED_TX_REAPPLY_WINDOW_SECS: u64 = 24 * 60 * 60;
+
 fn unix_time_secs() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
@@ -576,6 +580,20 @@ impl Wallet {
 			log_info!(
 				self.logger,
 				"Not rebroadcasting {}: an input is reserved for a channel funding",
+				txid
+			);
+			return false;
+		}
+		// Reapplying refreshes `last_seen`, so a transaction the network keeps rejecting would
+		// otherwise stay canonical, and keep its inputs from being spent, forever. Past the window
+		// it is left evicted and its inputs are spendable again.
+		let first_seen = wallet.tx_graph().get_tx_node(txid).and_then(|node| node.first_seen);
+		if first_seen.map_or(true, |first_seen| {
+			first_seen.saturating_add(EVICTED_TX_REAPPLY_WINDOW_SECS) <= unix_time_secs()
+		}) {
+			log_error!(
+				self.logger,
+				"Not rebroadcasting {}: it stayed out of the mempool too long, its inputs are released",
 				txid
 			);
 			return false;
@@ -13281,6 +13299,34 @@ mod tests {
 		assert!(!wallet.prepare_rebroadcast(&mut locked_wallet, &first_tx));
 		assert!(locked_wallet.get_tx(first).is_none());
 		assert!(locked_wallet.get_tx(second).is_some());
+	}
+
+	#[tokio::test]
+	async fn an_evicted_send_past_the_reapply_window_releases_its_inputs() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		fund_wallet(&wallet, &[100_000]).await;
+		let tx = {
+			let mut locked_wallet = wallet.inner.lock().unwrap();
+			let mut builder = locked_wallet.build_tx();
+			builder
+				.add_recipient(foreign_address().script_pubkey(), Amount::from_sat(50_000))
+				.fee_rate(FeeRate::from_sat_per_vb_u32(2));
+			let mut psbt = builder.finish().unwrap();
+			assert!(locked_wallet
+				.sign_with_signers(&mut psbt, &wallet.signers.each_ref(), SignOptions::default())
+				.unwrap());
+			let tx = psbt.extract_tx().unwrap();
+			// First seen long ago, evicted since.
+			locked_wallet.apply_unconfirmed_txs([(tx.clone(), 1)]);
+			locked_wallet.apply_evicted_txs([(tx.compute_txid(), 2)]);
+			tx
+		};
+
+		let mut locked_wallet = wallet.inner.lock().unwrap();
+		assert!(!wallet.prepare_rebroadcast(&mut locked_wallet, &tx));
+		assert!(locked_wallet.get_tx(tx.compute_txid()).is_none());
+		assert_eq!(locked_wallet.list_unspent().count(), 1);
 	}
 
 	#[tokio::test]
