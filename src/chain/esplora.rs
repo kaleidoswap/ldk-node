@@ -424,12 +424,10 @@ impl EsploraChainSource {
 	fn log_http_error(&self, e: esplora_client::Error, txids: &[Txid], txs: &SortedTransactions) {
 		match e {
 			esplora_client::Error::HttpResponse { status, message } => {
-				if status == 400 && txs.len() == 1 {
-					// Log 400 at lesser level, as this often just means bitcoind already knows the
-					// transaction.
-					// FIXME: We can further differentiate here based on the error
-					// message which will be available with rust-esplora-client 0.7 and
-					// later.
+				if status == 400 && txs.len() == 1 && is_already_known_rejection(&message) {
+					// Log at lesser level, as bitcoind merely already knows the transaction. Any
+					// other rejection (a conflict, a missing or spent input, a too-low fee) means
+					// the transaction did not propagate, and is logged as an error below.
 					log_trace!(
 						self.logger,
 						"Failed to broadcast due to HTTP connection error: {}",
@@ -536,5 +534,44 @@ impl Filter for EsploraChainSource {
 	}
 	fn register_output(&self, output: WatchedOutput) {
 		self.tx_sync.register_output(output);
+	}
+}
+
+/// Whether a rejected `sendrawtransaction` only means bitcoind already knows the transaction:
+/// it is in the mempool or a block already, so the broadcast effectively succeeded.
+fn is_already_known_rejection(message: &str) -> bool {
+	let message = message.to_ascii_lowercase();
+	[
+		"txn-already-in-mempool",
+		"txn-already-known",
+		"transaction already in block chain",
+		"transaction outputs already in utxo set",
+	]
+	.iter()
+	.any(|known| message.contains(known))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::is_already_known_rejection;
+
+	#[test]
+	fn only_already_known_rejections_are_benign() {
+		for benign in [
+			r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction already in block chain"}"#,
+			r#"sendrawtransaction RPC error: {"code":-26,"message":"txn-already-in-mempool"}"#,
+			r#"sendrawtransaction RPC error: {"code":-26,"message":"txn-already-known"}"#,
+			r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#,
+		] {
+			assert!(is_already_known_rejection(benign), "{benign}");
+		}
+		for rejected in [
+			r#"sendrawtransaction RPC error: {"code":-25,"message":"bad-txns-inputs-missingorspent"}"#,
+			r#"sendrawtransaction RPC error: {"code":-26,"message":"txn-mempool-conflict"}"#,
+			r#"sendrawtransaction RPC error: {"code":-26,"message":"min relay fee not met, 110 < 141"}"#,
+			"",
+		] {
+			assert!(!is_already_known_rejection(rejected), "{rejected}");
+		}
 	}
 }
