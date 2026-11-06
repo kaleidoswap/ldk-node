@@ -136,14 +136,28 @@ where
 	/// Classifies a queued package into payment records and returns the package ready for the
 	/// chain client. Returns `Err` if any classification fails; callers must not broadcast the
 	/// package in that case, since a crash would leave the transaction on-chain without a record.
+	///
+	/// Unclassified transactions are the wallet's own sends: they are prepared in the wallet
+	/// instead, and `Err` is also returned when the wallet refuses one because its inputs have
+	/// been spent or reserved elsewhere since.
 	pub(crate) async fn classify_package(
 		&self, package: BroadcastPackage,
 	) -> Result<BroadcastPackage, Error> {
 		let wallet_opt = self.wallet.lock().expect("lock").as_ref().and_then(Weak::upgrade);
 		if let Some(wallet) = wallet_opt {
 			for (tx, tx_type) in package.transactions() {
-				if let Some(tx_type) = tx_type {
-					wallet.classify_broadcast(tx, tx_type).await?;
+				match tx_type {
+					Some(tx_type) => {
+						wallet.classify_broadcast(tx, tx_type).await?;
+						if matches!(tx_type, LdkTransactionType::Funding { .. }) {
+							wallet.prepare_funding_broadcast(tx).await?;
+						}
+					},
+					None => {
+						if !wallet.prepare_unclassified_broadcast(tx).await? {
+							return Err(Error::WalletOperationFailed);
+						}
+					},
 				}
 			}
 		}

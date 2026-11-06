@@ -763,6 +763,7 @@ where
 					.await;
 				match funding_transaction {
 					Ok(final_tx) => {
+						let funding_tx = final_tx.clone();
 						let needs_manual_broadcast = self
 							.liquidity_source
 							.lsps2_service()
@@ -790,6 +791,18 @@ where
 								final_tx,
 							)
 						};
+
+						if result.is_err() {
+							// LDK will never broadcast this transaction, nor emit `DiscardFunding`
+							// for it: release the inputs it reserved right away.
+							if let Err(e) = self.wallet.cancel_tx(funding_tx).await {
+								log_error!(
+									self.logger,
+									"Failed to release unused funding transaction state: {}",
+									e
+								);
+							}
+						}
 
 						match result {
 							Ok(()) => {},
@@ -2013,6 +2026,18 @@ where
 					};
 					if let Err(e) = self.wallet.cancel_tx(tx).await {
 						log_error!(self.logger, "Failed reclaiming unused addresses: {}", e);
+						return Err(ReplayEvent());
+					}
+				} else if let FundingInfo::Tx { transaction } = funding_info {
+					// A funding transaction we created but LDK never broadcast: release the inputs
+					// it reserved in `create_funding_transaction`, and its change address.
+					log_info!(
+						self.logger,
+						"Releasing the unused funding transaction of channel {}",
+						channel_id,
+					);
+					if let Err(e) = self.wallet.cancel_tx(transaction).await {
+						log_error!(self.logger, "Failed releasing unused funding inputs: {}", e);
 						return Err(ReplayEvent());
 					}
 				}

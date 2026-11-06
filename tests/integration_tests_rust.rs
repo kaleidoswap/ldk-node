@@ -1230,6 +1230,64 @@ async fn electrum_registrations_survive_chain_source_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn back_to_back_onchain_sends_before_sync() {
+	// Two sends made before the wallet syncs used to select the same coin: the network accepted
+	// the first and rejected the second, while both callers were handed a txid.
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+	let config = random_config();
+	setup_builder!(builder, config.node_config);
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+	builder.set_chain_source_esplora(esplora_url, Some(sync_config));
+	let node = builder.build(config.node_entropy.into()).unwrap();
+	node.start().unwrap();
+
+	// A single coin, so the second send can only be funded by the first one's change.
+	let funding_address = node.onchain_payment().new_address().unwrap();
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![funding_address],
+		Amount::from_sat(500_000),
+	)
+	.await;
+	node.sync_wallets().unwrap();
+
+	let first_address = bitcoind.client.new_address().unwrap();
+	let second_address = bitcoind.client.new_address().unwrap();
+	let first_txid = node.onchain_payment().send_to_address(&first_address, 100_000, None).unwrap();
+	let second_txid =
+		node.onchain_payment().send_to_address(&second_address, 100_000, None).unwrap();
+
+	wait_for_tx(&electrsd.client, first_txid).await;
+	wait_for_tx(&electrsd.client, second_txid).await;
+	let mempool = bitcoind.client.get_raw_mempool().unwrap().into_model().unwrap();
+	assert!(mempool.0.contains(&first_txid), "first send must reach the mempool");
+	assert!(mempool.0.contains(&second_txid), "second send must reach the mempool");
+
+	// A sync afterwards keeps both, and both confirm.
+	node.sync_wallets().unwrap();
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+	node.sync_wallets().unwrap();
+	for txid in [first_txid, second_txid] {
+		let payment = node
+			.list_payments_matching(
+				|p| matches!(p.kind, PaymentKind::Onchain { txid: t, .. } if t == txid),
+			)
+			.pop()
+			.expect("each send is recorded as a payment");
+		assert_eq!(payment.direction, PaymentDirection::Outbound);
+		assert!(matches!(
+			payment.kind,
+			PaymentKind::Onchain { status: ConfirmationStatus::Confirmed { .. }, .. }
+		));
+	}
+
+	node.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn onchain_send_receive() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
