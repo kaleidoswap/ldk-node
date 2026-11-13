@@ -161,6 +161,7 @@ enum NodeError {
 	"PaymentSendingFailed",
 	"InvalidCustomTlvs",
 	"ProbeSendingFailed",
+	"RouteNotFound",
 	"ChannelCreationFailed",
 	"ChannelClosingFailed",
 	"ChannelSplicingFailed",

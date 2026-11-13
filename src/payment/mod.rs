@@ -21,8 +21,8 @@ pub(crate) mod store;
 #[cfg(feature = "unified-payments")]
 mod unified;
 
-pub use bolt11::Bolt11Payment;
 pub(crate) use bolt11::PaymentMetadata;
+pub use bolt11::{Bolt11Payment, RouteEstimate};
 pub use bolt12::{Bolt12Payment, PayerProofOptions};
 pub use forwarding::{
 	ChannelForwardingStats, ChannelForwardingStatsPage, ChannelPairForwardingStats,

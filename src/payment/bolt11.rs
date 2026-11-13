@@ -18,7 +18,9 @@ use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, PaymentId,
 };
 use lightning::ln::outbound_payment::{Bolt11PaymentError, Retry, RetryableSendFailure};
-use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+use lightning::routing::router::{
+	PaymentParameters, RouteParameters, RouteParametersConfig, Router as _,
+};
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
 };
@@ -37,7 +39,7 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, PaymentStore, Router};
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -59,6 +61,21 @@ impl_writeable_tlv_based!(PaymentMetadata, {
 	(0, lsps2_parameters, option),
 });
 
+/// An estimate of the route a payment would currently take.
+///
+/// Returned by [`Bolt11Payment::estimate_route`] and
+/// [`Bolt11Payment::estimate_route_using_amount`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RouteEstimate {
+	/// The amount that would arrive at the recipient, in millisatoshis.
+	pub amount_msat: u64,
+	/// The routing fees that would be paid across all paths, in millisatoshis.
+	pub total_fee_msat: u64,
+	/// The number of paths the payment would be split over.
+	pub path_count: u32,
+}
+
 /// A payment handler allowing to create and pay [BOLT 11] invoices.
 ///
 /// Should be retrieved by calling [`Node::bolt11_payment`].
@@ -69,6 +86,7 @@ impl_writeable_tlv_based!(PaymentMetadata, {
 pub struct Bolt11Payment {
 	runtime: Arc<Runtime>,
 	channel_manager: Arc<ChannelManager>,
+	router: Arc<Router>,
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
@@ -80,7 +98,7 @@ pub struct Bolt11Payment {
 
 impl Bolt11Payment {
 	pub(crate) fn new(
-		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
+		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>, router: Arc<Router>,
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
 		peer_store: Arc<PeerStore<Arc<Logger>>>, config: Arc<Config>,
@@ -89,6 +107,7 @@ impl Bolt11Payment {
 		Self {
 			runtime,
 			channel_manager,
+			router,
 			connection_manager,
 			liquidity_source,
 			payment_store,
@@ -298,6 +317,40 @@ impl Bolt11Payment {
 				}
 			},
 		}
+	}
+}
+
+impl Bolt11Payment {
+	fn estimate_route_internal(
+		&self, invoice: &LdkBolt11Invoice, amount_msat: u64,
+		route_parameters: Option<RouteParametersConfig>,
+	) -> Result<RouteEstimate, Error> {
+		let payment_params = PaymentParameters::from_bolt11_invoice(invoice);
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
+
+		if let Some(config) = route_parameters.as_ref().or(self.config.route_parameters.as_ref()) {
+			apply_route_parameters_config(&mut route_params, config);
+		}
+
+		let payer = self.channel_manager.get_our_node_id();
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let first_hops = usable_channels.iter().collect::<Vec<_>>();
+		let inflight_htlcs = self.channel_manager.compute_inflight_htlcs();
+
+		let route = self
+			.router
+			.find_route(&payer, &route_params, Some(&first_hops), inflight_htlcs)
+			.map_err(|e| {
+				log_info!(self.logger, "Failed to find a route for the given invoice: {}", e);
+				Error::RouteNotFound
+			})?;
+
+		Ok(RouteEstimate {
+			amount_msat: route.get_total_amount(),
+			total_fee_msat: route.get_total_fees(),
+			path_count: route.paths.len() as u32,
+		})
 	}
 }
 
@@ -801,6 +854,74 @@ impl Bolt11Payment {
 			Some(payment_hash),
 		)?;
 		Ok(maybe_wrap(invoice))
+	}
+
+	/// Estimates the route a payment of the given invoice would currently take, without sending
+	/// anything.
+	///
+	/// This runs the same pathfinding a payment would, i.e., over the network graph and the
+	/// scorer, using the invoice's route hints, our usable channels as first hops, and taking
+	/// currently in-flight HTLCs into account. In contrast to [`Self::send_probes`], no HTLC is
+	/// sent and hence no liquidity is committed, which makes it suitable for checking whether an
+	/// invoice provided by an untrusted party is likely payable before taking on any obligation.
+	///
+	/// Note that the returned estimate is based on our current view of the network only. It is
+	/// neither a reservation nor a guarantee: the actual payment might still fail, take different
+	/// paths, or pay different fees, e.g., if a channel lacks the liquidity the graph suggests.
+	///
+	/// Returns [`Error::RouteNotFound`] if no route satisfying the route parameters could be
+	/// found.
+	///
+	/// If `route_parameters` are provided they will override the default as well as the
+	/// node-wide parameters configured via [`Config::route_parameters`] on a per-field basis.
+	pub fn estimate_route(
+		&self, invoice: &Bolt11Invoice, route_parameters: Option<RouteParametersConfig>,
+	) -> Result<RouteEstimate, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let invoice = maybe_deref(invoice);
+		let amount_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
+			log_error!(self.logger, "Failed to estimate route due to the given invoice being \"zero-amount\". Please use estimate_route_using_amount instead.");
+			Error::InvalidInvoice
+		})?;
+
+		self.estimate_route_internal(invoice, amount_msat, route_parameters)
+	}
+
+	/// Estimates the route a payment of the given zero-value invoice using the given amount would
+	/// currently take, without sending anything.
+	///
+	/// This can be used for a so-called "zero-amount" invoice, i.e., an invoice that leaves the
+	/// amount paid to be determined by the user.
+	///
+	/// If `route_parameters` are provided they will override the default as well as the
+	/// node-wide parameters configured via [`Config::route_parameters`] on a per-field basis.
+	///
+	/// See [`Self::estimate_route`] for more information.
+	pub fn estimate_route_using_amount(
+		&self, invoice: &Bolt11Invoice, amount_msat: u64,
+		route_parameters: Option<RouteParametersConfig>,
+	) -> Result<RouteEstimate, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let invoice = maybe_deref(invoice);
+		if let Some(invoice_amount_msat) = invoice.amount_milli_satoshis() {
+			if amount_msat < invoice_amount_msat {
+				log_error!(
+					self.logger,
+					"Failed to estimate route as the given amount needs to be at least the invoice amount: required {}msat, gave {}msat.",
+					invoice_amount_msat,
+					amount_msat
+				);
+				return Err(Error::InvalidAmount);
+			}
+		}
+
+		self.estimate_route_internal(invoice, amount_msat, route_parameters)
 	}
 
 	/// Sends payment probes over all paths of a route that would be used to pay the given invoice.

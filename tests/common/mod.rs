@@ -1424,6 +1424,30 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		.receive(invoice_amount_1_msat, &invoice_description.clone().into(), 9217)
 		.unwrap();
 
+	println!("\nA estimate_route");
+	let payment_count = node_a.list_payments_matching(|_| true).len();
+	let route_estimate = node_a.bolt11_payment().estimate_route(&invoice, None).unwrap();
+	assert_eq!(route_estimate.amount_msat, invoice_amount_1_msat);
+	assert_eq!(route_estimate.total_fee_msat, 0);
+	assert_eq!(route_estimate.path_count, 1);
+	assert_eq!(
+		Err(NodeError::InvalidAmount),
+		node_a.bolt11_payment().estimate_route_using_amount(
+			&invoice,
+			invoice_amount_1_msat - 1,
+			None
+		)
+	);
+	assert_eq!(
+		Err(NodeError::RouteNotFound),
+		node_a.bolt11_payment().estimate_route_using_amount(
+			&invoice,
+			funding_amount_sat * 1000 * 2,
+			None
+		)
+	);
+	assert_eq!(node_a.list_payments_matching(|_| true).len(), payment_count);
+
 	println!("\nA send");
 	let outbound_payment_id = node_a.bolt11_payment().send(&invoice, None).unwrap();
 	assert_eq!(Err(NodeError::DuplicatePayment), node_a.bolt11_payment().send(&invoice, None));
@@ -1530,6 +1554,15 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		Err(NodeError::InvalidInvoice),
 		node_a.bolt11_payment().send(&variable_amount_invoice, None)
 	);
+	assert_eq!(
+		Err(NodeError::InvalidInvoice),
+		node_a.bolt11_payment().estimate_route(&variable_amount_invoice, None)
+	);
+	let route_estimate = node_a
+		.bolt11_payment()
+		.estimate_route_using_amount(&variable_amount_invoice, determined_amount_msat, None)
+		.unwrap();
+	assert_eq!(route_estimate.amount_msat, determined_amount_msat);
 	println!("\nA send_using_amount");
 	let outbound_payment_id = node_a
 		.bolt11_payment()

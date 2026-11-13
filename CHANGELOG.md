@@ -76,6 +76,9 @@
   if unset.
   `Node::bump_channel_funding_fee` takes the same optional `min_fee_rate` for the replacement
   transaction.
+- `Bolt11Payment::estimate_route` and `Bolt11Payment::estimate_route_using_amount` allow to
+  check whether a route for an invoice can currently be found, and at which fees, without
+  sending any HTLC. If no route is found, the new `Error::RouteNotFound` is returned.
 
 ## Bug Fixes and Improvements
 - `Node::bump_channel_funding_fee` can now fee-bump a splice made with
