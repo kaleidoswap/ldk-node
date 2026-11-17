@@ -531,10 +531,15 @@ impl Wallet {
 	}
 
 	pub(crate) async fn apply_update(&self, update: impl Into<Update>) -> Result<(), Error> {
+		let mut update = update.into();
 		let mut locked_persister = self.persister.lock().await;
 		let pending_sends = self.pending_send_txids().await;
 		let events = {
 			let mut locked_wallet = self.inner.lock().expect("lock");
+			let local_tip_height = locked_wallet.latest_checkpoint().height();
+			if let Some(tip) = update.chain.take() {
+				update.chain = Some(thin_chain_update(tip, local_tip_height, &update.tx_update));
+			}
 			let applied = locked_wallet.events_helper(|wallet| {
 				wallet.apply_update(update)?;
 				Self::restore_evicted_sends(wallet, &pending_sends);
@@ -4900,6 +4905,119 @@ fn ldk_to_bdk_satisfaction_weight(ldk_satisfaction_weight: u64) -> Weight {
 		ldk_satisfaction_weight
 			.saturating_sub(EMPTY_SCRIPT_SIG_WEIGHT + EMPTY_WITNESS_COUNT_WEIGHT),
 	)
+}
+
+/// Drops the blocks of a chain update that lie above our local tip but that the wallet does not
+/// need: anything that is neither the new tip nor the block of an anchor in the update.
+///
+/// Chain sources add the most recent blocks they saw to every update, so applying them as-is
+/// grows the local chain by every block, and BDK's checkpoint lookups walk that chain linearly
+/// (see [`persist::compact_local_chain`]). Blocks at or below our tip are left alone, so the
+/// update still meets the local chain at the same point of agreement and still carries any
+/// conflicting (reorged) blocks.
+fn thin_chain_update(
+	update_tip: bdk_chain::CheckPoint, local_tip_height: u32,
+	tx_update: &bdk_chain::TxUpdate<bdk_chain::ConfirmationBlockTime>,
+) -> bdk_chain::CheckPoint {
+	if update_tip.height() <= local_tip_height {
+		return update_tip;
+	}
+	let anchor_heights: HashSet<u32> =
+		tx_update.anchors.iter().map(|(anchor, _)| anchor.block_id.height).collect();
+
+	let mut kept = Vec::new();
+	let mut base = None;
+	for cp in update_tip.iter() {
+		if cp.height() <= local_tip_height {
+			base = Some(cp);
+			break;
+		}
+		if cp.height() == update_tip.height() || anchor_heights.contains(&cp.height()) {
+			kept.push(cp.block_id());
+		}
+	}
+	match base {
+		Some(base) => base.extend(kept.into_iter().rev()).unwrap_or(update_tip),
+		None => update_tip,
+	}
+}
+
+#[cfg(test)]
+mod thin_chain_update_tests {
+	use bdk_chain::local_chain::LocalChain;
+	use bdk_chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+	use bitcoin::hashes::Hash;
+	use bitcoin::{BlockHash, Txid};
+
+	use super::thin_chain_update;
+
+	fn block(height: u32, fork: u8) -> BlockId {
+		let mut bytes = [0u8; 32];
+		bytes[..4].copy_from_slice(&height.to_le_bytes());
+		bytes[31] = fork;
+		BlockId { height, hash: BlockHash::from_byte_array(bytes) }
+	}
+
+	fn chain(heights: impl IntoIterator<Item = u32>, fork: u8) -> CheckPoint {
+		CheckPoint::from_block_ids(heights.into_iter().map(|h| block(h, fork))).unwrap()
+	}
+
+	fn anchored_at(heights: &[u32]) -> TxUpdate<ConfirmationBlockTime> {
+		let mut tx_update = TxUpdate::default();
+		for (i, height) in heights.iter().enumerate() {
+			let anchor =
+				ConfirmationBlockTime { block_id: block(*height, 0), confirmation_time: 0 };
+			tx_update.anchors.insert((anchor, Txid::from_byte_array([i as u8; 32])));
+		}
+		tx_update
+	}
+
+	fn heights(cp: &CheckPoint) -> Vec<u32> {
+		let mut heights: Vec<u32> = cp.iter().map(|cp| cp.height()).collect();
+		heights.reverse();
+		heights
+	}
+
+	#[test]
+	fn keeps_only_the_tip_and_anchors_above_the_local_tip() {
+		let mut local = LocalChain::from_tip(chain(0..=100, 0)).unwrap();
+		// Like Esplora's, the update is built on top of our own chain.
+		let update = local.tip().extend((101..=120).map(|h| block(h, 0))).unwrap();
+
+		let thinned = thin_chain_update(update, 100, &anchored_at(&[90, 110]));
+
+		assert_eq!(heights(&thinned)[99..], [99, 100, 110, 120]);
+		local.apply_update(thinned).unwrap();
+		assert_eq!(local.tip().block_id(), block(120, 0));
+		assert_eq!(local.get(110).map(|cp| cp.block_id()), Some(block(110, 0)));
+		assert!(local.get(115).is_none());
+	}
+
+	#[test]
+	fn keeps_conflicting_blocks_at_or_below_the_local_tip() {
+		let mut local = LocalChain::from_tip(chain(0..=100, 0)).unwrap();
+		// A reorg replacing blocks 99 and 100, then extending to 110.
+		let update = chain(0..=98, 0)
+			.extend((99..=100).map(|h| block(h, 1)))
+			.unwrap()
+			.extend((101..=110).map(|h| block(h, 1)))
+			.unwrap();
+
+		let thinned = thin_chain_update(update, 100, &TxUpdate::default());
+
+		assert_eq!(heights(&thinned)[97..], [97, 98, 99, 100, 110]);
+		local.apply_update(thinned).unwrap();
+		assert_eq!(local.tip().block_id(), block(110, 1));
+		assert_eq!(local.get(99).map(|cp| cp.block_id()), Some(block(99, 1)));
+		assert_eq!(local.get(100).map(|cp| cp.block_id()), Some(block(100, 1)));
+	}
+
+	#[test]
+	fn leaves_updates_that_do_not_extend_the_local_tip_unchanged() {
+		let update = chain(0..=100, 0);
+		let thinned = thin_chain_update(update.clone(), 100, &TxUpdate::default());
+		assert_eq!(heights(&thinned), heights(&update));
+	}
 }
 
 #[cfg(all(test, any(feature = "chain-esplora", feature = "chain-electrum")))]
