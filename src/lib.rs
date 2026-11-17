@@ -402,24 +402,15 @@ impl Node {
 			zero_fee_commitments_support_required,
 		))?;
 
-		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-		let stop_sync_receiver = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let sync_wallet = Arc::clone(&self.wallet);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		self.runtime.spawn_background_task(async move {
-			chain_source
-				.continuously_sync_wallets(
-					stop_sync_receiver,
-					sync_wallet,
-					sync_cman,
-					sync_cmon,
-					sync_sweeper,
-				)
-				.await;
-		});
+		// Spawn background tasks continuously syncing onchain, lightning, and fee rate cache.
+		self.chain_source.start_background_sync(
+			&self.runtime,
+			&self.stop_sender,
+			Arc::clone(&self.wallet),
+			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.chain_monitor),
+			Arc::clone(&self.output_sweeper),
+		);
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
