@@ -168,8 +168,16 @@ pub const MAX_FULL_SCAN_STOP_GAP: u32 = 1000;
 /// visibility: the reveals keep the scripts watched and the scan discovers any prior use.
 pub const ADDRESS_POOL_SIZE: u32 = 16;
 
+/// The default number of concurrent Esplora requests an on-chain wallet sync makes.
+pub const DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS: u32 = 4;
+
+/// The maximum allowed number of concurrent Esplora requests an on-chain wallet sync makes.
+///
+/// Values above 64 are clamped to 64 when a sync runs.
+pub const MAX_WALLET_SYNC_PARALLEL_REQUESTS: u32 = 64;
+
 // The number of concurrent requests made against the API provider.
-pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
+pub(crate) const BDK_CLIENT_CONCURRENCY: usize = DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS as usize;
 
 // The timeout after which we abandon retrying failed payments.
 pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -724,6 +732,18 @@ pub struct EsploraSyncConfig {
 	/// This can be useful when restoring a wallet from seed on a node that has already synced
 	/// before, but may be missing funds sent to previously-unknown addresses.
 	pub force_wallet_full_scan: bool,
+	/// The number of concurrent Esplora requests an on-chain wallet sync or full scan makes.
+	///
+	/// An incremental sync queries every script pubkey the wallet has revealed, one request
+	/// each, so its duration grows with the wallet's history divided by this value. Raise it
+	/// when the server is close and allows it, or when syncs take longer than a block.
+	///
+	/// **Default:** 4 ([`DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS`])
+	///
+	/// **Allowed values:** 1 to 64 ([`MAX_WALLET_SYNC_PARALLEL_REQUESTS`]), inclusive. Values
+	/// outside this range will be clamped to the nearest bound and a warning will be logged
+	/// when the sync runs.
+	pub wallet_sync_parallel_requests: u32,
 }
 
 impl Default for EsploraSyncConfig {
@@ -733,6 +753,7 @@ impl Default for EsploraSyncConfig {
 			timeouts_config: SyncTimeoutsConfig::default(),
 			full_scan_stop_gap: DEFAULT_FULL_SCAN_STOP_GAP,
 			force_wallet_full_scan: false,
+			wallet_sync_parallel_requests: DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS,
 		}
 	}
 }
@@ -790,6 +811,10 @@ impl Default for ElectrumSyncConfig {
 
 pub(crate) fn clamp_full_scan_stop_gap(full_scan_stop_gap: u32) -> u32 {
 	full_scan_stop_gap.clamp(MIN_FULL_SCAN_STOP_GAP, MAX_FULL_SCAN_STOP_GAP)
+}
+
+pub(crate) fn clamp_wallet_sync_parallel_requests(parallel_requests: u32) -> u32 {
+	parallel_requests.clamp(1, MAX_WALLET_SYNC_PARALLEL_REQUESTS)
 }
 
 pub(crate) fn apply_route_parameters_config(
@@ -960,9 +985,11 @@ mod tests {
 	use std::str::FromStr;
 
 	use super::{
-		clamp_full_scan_stop_gap, default_user_config, may_announce_channel, AnnounceError, Config,
-		ElectrumSyncConfig, EsploraSyncConfig, NodeAlias, SocketAddress,
-		DEFAULT_FULL_SCAN_STOP_GAP, MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
+		clamp_full_scan_stop_gap, clamp_wallet_sync_parallel_requests, default_user_config,
+		may_announce_channel, AnnounceError, Config, ElectrumSyncConfig, EsploraSyncConfig,
+		NodeAlias, SocketAddress, BDK_CLIENT_CONCURRENCY, DEFAULT_FULL_SCAN_STOP_GAP,
+		DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS, MAX_FULL_SCAN_STOP_GAP,
+		MAX_WALLET_SYNC_PARALLEL_REQUESTS, MIN_FULL_SCAN_STOP_GAP,
 	};
 
 	#[test]
@@ -1058,5 +1085,20 @@ mod tests {
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP), MAX_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(0), MIN_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP + 1), MAX_FULL_SCAN_STOP_GAP);
+	}
+
+	#[test]
+	fn wallet_sync_parallel_requests_default_and_clamp() {
+		assert_eq!(
+			EsploraSyncConfig::default().wallet_sync_parallel_requests,
+			DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS
+		);
+		assert_eq!(BDK_CLIENT_CONCURRENCY, DEFAULT_WALLET_SYNC_PARALLEL_REQUESTS as usize);
+		assert_eq!(clamp_wallet_sync_parallel_requests(0), 1);
+		assert_eq!(clamp_wallet_sync_parallel_requests(16), 16);
+		assert_eq!(
+			clamp_wallet_sync_parallel_requests(MAX_WALLET_SYNC_PARALLEL_REQUESTS + 1),
+			MAX_WALLET_SYNC_PARALLEL_REQUESTS
+		);
 	}
 }

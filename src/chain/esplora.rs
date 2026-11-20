@@ -20,8 +20,8 @@ use lightning_transaction_sync::EsploraSyncClient;
 
 use super::{WalletSyncGuard, WalletSyncStatus};
 use crate::config::{
-	clamp_full_scan_stop_gap, Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY,
-	MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
+	clamp_full_scan_stop_gap, clamp_wallet_sync_parallel_requests, Config, EsploraSyncConfig,
+	MAX_FULL_SCAN_STOP_GAP, MAX_WALLET_SYNC_PARALLEL_REQUESTS, MIN_FULL_SCAN_STOP_GAP,
 };
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
@@ -230,7 +230,7 @@ impl EsploraChainSource {
 				Duration::from_secs(
 					self.sync_config.timeouts_config.onchain_wallet_sync_timeout_secs,
 				),
-				self.esplora_client.sync(sync_request, BDK_CLIENT_CONCURRENCY),
+				self.esplora_client.sync(sync_request, self.bounded_parallel_requests()),
 			);
 			get_and_apply_wallet_update!(wallet_sync_timeout_fut)
 		} else {
@@ -243,7 +243,7 @@ impl EsploraChainSource {
 				self.esplora_client.full_scan(
 					full_scan_request,
 					full_scan_stop_gap,
-					BDK_CLIENT_CONCURRENCY,
+					self.bounded_parallel_requests(),
 				),
 			);
 			get_and_apply_wallet_update!(wallet_sync_timeout_fut)
@@ -252,6 +252,21 @@ impl EsploraChainSource {
 			self.force_wallet_full_scan.store(false, Ordering::Release);
 		}
 		res
+	}
+
+	fn bounded_parallel_requests(&self) -> usize {
+		let configured = self.sync_config.wallet_sync_parallel_requests;
+		let bounded = clamp_wallet_sync_parallel_requests(configured);
+		if bounded != configured {
+			log_warn!(
+				self.logger,
+				"Configured Esplora on-chain wallet sync parallel requests {} is outside the allowed range 1..={}; using {}.",
+				configured,
+				MAX_WALLET_SYNC_PARALLEL_REQUESTS,
+				bounded
+			);
+		}
+		bounded as usize
 	}
 
 	fn bounded_full_scan_stop_gap(&self) -> usize {
