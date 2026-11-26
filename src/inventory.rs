@@ -196,6 +196,44 @@ pub struct FinancialInventory {
 	pub latest_wallet_sync: Option<u64>,
 	/// Last successful Lightning sync, UNIX seconds.
 	pub latest_lightning_sync: Option<u64>,
+	/// Set when `payments` holds only a delta rather than the whole history.
+	#[serde(default)]
+	pub payment_delta: Option<PaymentDelta>,
+}
+
+/// What a reader asks [`crate::Node::financial_inventory_delta`] for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaymentDeltaRequest {
+	/// Newest payment ID the reader already holds; `None` on its first read.
+	pub since: Option<String>,
+	/// Payment IDs to read again, e.g. those the reader still holds as pending.
+	pub reread: Vec<String>,
+	/// Continue a backfill of older history: `Some(None)` starts from the newest payment,
+	/// `Some(Some(token))` resumes from the token a previous delta returned.
+	pub backfill: Option<Option<String>>,
+	/// Store pages to read for each of the head scan and the backfill.
+	pub page_budget: u32,
+}
+
+/// Evidence of how a delta inventory's `payments` were selected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaymentDelta {
+	/// The `since` the reader sent.
+	pub since: Option<String>,
+	/// Newest payment ID at the snapshot revision; the reader's next `since`.
+	pub head: Option<String>,
+	/// False when `since` no longer exists: the reader must rebuild, not extend, its history.
+	pub since_found: bool,
+	/// IDs created after `since`, newest first.
+	pub created: Vec<String>,
+	/// Requested re-reads that no longer exist.
+	pub missing: Vec<String>,
+	/// IDs read for the backfill, newest first.
+	pub backfilled: Vec<String>,
+	/// Whether a backfill was requested.
+	pub backfill_requested: bool,
+	/// Where the next backfill resumes; `None` with `backfill_requested` means it is complete.
+	pub next_backfill: Option<String>,
 }
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -451,6 +489,7 @@ impl crate::Node {
 			payments: Vec::new(),
 			latest_wallet_sync: status.latest_onchain_wallet_sync_timestamp,
 			latest_lightning_sync: status.latest_lightning_wallet_sync_timestamp,
+			payment_delta: None,
 		}
 	}
 }
@@ -545,7 +584,7 @@ impl crate::Node {
 	/// boundary. Secondary locks are try-locks to avoid inversion with LDK writers.
 	/// Contention returns explicitly non-atomic evidence, never a guessed snapshot.
 	pub fn financial_inventory(&self) -> FinancialInventory {
-		self.financial_inventory_with_durable(None)
+		self.financial_inventory_with_durable(None, None)
 	}
 
 	/// Complete durable payment history, bounded to 10,000 records and five seconds.
@@ -558,7 +597,7 @@ impl crate::Node {
 		)
 		.await
 		{
-			Ok(Ok(snapshot)) => self.financial_inventory_with_durable(Some(snapshot)),
+			Ok(Ok(snapshot)) => self.financial_inventory_with_durable(Some(snapshot), None),
 			_ => {
 				let mut inventory = self.financial_inventory();
 				inventory.gaps.push("payment_history_snapshot_unavailable".into());
@@ -567,8 +606,64 @@ impl crate::Node {
 		}
 	}
 
+	/// Like [`Self::financial_inventory_durable`], but `payments` holds only what changed since
+	/// the reader's last delta (plus its re-reads and an optional backfill page run), so its cost
+	/// follows new activity rather than lifetime history. Bounded to five seconds; failure keeps
+	/// explicit incomplete evidence.
+	pub async fn financial_inventory_delta(
+		&self, request: PaymentDeltaRequest,
+	) -> FinancialInventory {
+		const OBJECT_LIMIT: usize = 10_000;
+		let backfill = request
+			.backfill
+			.clone()
+			.map(|token| token.map(lightning::util::persist::PageToken::new));
+		let read = tokio::time::timeout(
+			std::time::Duration::from_secs(5),
+			self.payment_store.durable_delta(
+				request.since.as_deref(),
+				&request.reread,
+				backfill,
+				request.page_budget as usize,
+				OBJECT_LIMIT,
+			),
+		)
+		.await;
+		let (revision, read) = match read {
+			Ok(Ok(read)) => read,
+			_ => {
+				let mut inventory = self.financial_inventory();
+				inventory.gaps.push("payment_history_delta_unavailable".into());
+				return inventory;
+			},
+		};
+		let ids = |payments: &[crate::payment::PaymentDetails]| {
+			payments.iter().map(|p| crate::hex_utils::to_string(&p.id.0)).collect()
+		};
+		let delta = PaymentDelta {
+			since: request.since,
+			head: read.head,
+			since_found: read.since_found,
+			created: ids(&read.created),
+			missing: read.missing,
+			backfilled: ids(&read.backfill),
+			backfill_requested: request.backfill.is_some(),
+			next_backfill: read.next_backfill.map(|t| t.as_str().to_owned()),
+		};
+		let mut seen = std::collections::HashSet::new();
+		let payments = read
+			.created
+			.into_iter()
+			.chain(read.reread)
+			.chain(read.backfill)
+			.filter(|p| seen.insert(p.id))
+			.collect();
+		self.financial_inventory_with_durable(Some((revision, payments)), Some(delta))
+	}
+
 	fn financial_inventory_with_durable(
 		&self, durable: Option<(u64, Vec<crate::payment::PaymentDetails>)>,
+		delta: Option<PaymentDelta>,
 	) -> FinancialInventory {
 		let started_at_ms = now_ms();
 		let status = self.status();
@@ -644,6 +739,7 @@ impl crate::Node {
 												.latest_onchain_wallet_sync_timestamp,
 											latest_lightning_sync: status
 												.latest_lightning_wallet_sync_timestamp,
+											payment_delta: delta.clone(),
 										}
 									};
 									match durable {
@@ -761,6 +857,20 @@ mod tests {
 		assert!(first.gaps.contains(&"payment_history_cached_only".to_owned()));
 		assert!(first.atomic);
 		assert_eq!(first.schema_version, 2);
+		let delta = node.runtime.block_on(node.financial_inventory_delta(PaymentDeltaRequest {
+			since: None,
+			reread: vec!["00".repeat(32)],
+			backfill: Some(None),
+			page_budget: 1,
+		}));
+		assert_eq!(delta.schema_version, 2);
+		assert!(delta.payments.is_empty());
+		assert!(!delta.gaps.contains(&"payment_history_cached_only".to_owned()));
+		let evidence = delta.payment_delta.expect("delta evidence");
+		assert_eq!(evidence.head, None);
+		assert!(evidence.since_found && evidence.backfill_requested);
+		assert_eq!(evidence.next_backfill, None);
+		assert_eq!(evidence.missing, vec!["00".repeat(32)]);
 		let contended =
 			node.payment_store.try_with_objects(|_, _| node.financial_inventory()).unwrap();
 		assert!(!contended.atomic);
