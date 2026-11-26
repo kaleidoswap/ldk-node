@@ -297,6 +297,24 @@ pub(crate) struct DataStorePage<SO> {
 	pub next_page_token: Option<PageToken>,
 }
 
+/// What [`DataStore::durable_delta`] read at one revision.
+pub(crate) struct DurableDelta<SO> {
+	/// The most recently created key at that revision, `None` for an empty namespace.
+	pub head: Option<String>,
+	/// Whether the scan reached the reader's `since` key (always true without one).
+	pub since_found: bool,
+	/// Objects created after `since`, newest first.
+	pub created: Vec<SO>,
+	/// The requested re-reads that still exist.
+	pub reread: Vec<SO>,
+	/// Requested re-reads that no longer exist.
+	pub missing: Vec<String>,
+	/// Older objects read for a backfill, newest first.
+	pub backfill: Vec<SO>,
+	/// Where the backfill resumes, `None` once it reached the oldest object.
+	pub next_backfill: Option<PageToken>,
+}
+
 pub(crate) struct DataStore<SO: StorableObject, L: Deref, P: CachePolicy = KeepAllEntries>
 where
 	L::Target: LdkLogger,
@@ -585,6 +603,125 @@ where
 			}
 		}
 		Err(Error::PersistenceFailed)
+	}
+
+	/// A bounded, revision-fenced durable read of what changed since a reader last looked:
+	/// objects created after `since` (newest first, stopping at `since`), the `reread` objects,
+	/// and, when `backfill` is set, up to `page_budget` older pages resumed from its token.
+	/// Like [`Self::durable_snapshot`], it never expands the cache and fails rather than return
+	/// a partial or torn view; the caller revalidates `revision` with [`Self::try_with_revision`].
+	///
+	/// A `since` that the scan never reaches within `page_budget` pages is an error unless the
+	/// namespace has nothing newer at all, in which case `since_found` is `false`: the reader's
+	/// key is gone, so its view of the namespace must be rebuilt rather than extended.
+	pub(crate) async fn durable_delta(
+		&self, since: Option<&str>, reread: &[String], backfill: Option<Option<PageToken>>,
+		page_budget: usize, object_limit: usize,
+	) -> Result<(u64, DurableDelta<SO>), Error> {
+		if reread.len() > object_limit {
+			return Err(Error::PersistenceFailed);
+		}
+		let revision = {
+			let _guard = self.mutation_lock.read().await;
+			self.mutation_revision.load(Ordering::SeqCst)
+		};
+		let page_budget = page_budget.max(1);
+		let mut seen = std::collections::BTreeSet::new();
+		let mut head = None;
+		let mut created_keys = Vec::new();
+		let mut since_found = since.is_none();
+		let mut exhausted = false;
+		let mut token = None;
+		for _ in 0..page_budget {
+			let page = self.list_keys_page(token).await?;
+			if head.is_none() {
+				head = page.keys.first().cloned();
+			}
+			let Some(since) = since else { break };
+			for key in page.keys {
+				if key == since {
+					since_found = true;
+					break;
+				}
+				if !seen.insert(key.clone()) {
+					return Err(Error::PersistenceFailed);
+				}
+				created_keys.push(key);
+			}
+			if since_found {
+				break;
+			}
+			match page.next_page_token {
+				Some(next) => token = Some(next),
+				None => {
+					exhausted = true;
+					break;
+				},
+			}
+		}
+		if !since_found && !exhausted {
+			return Err(Error::PersistenceFailed);
+		}
+		let mut backfill_keys = Vec::new();
+		let mut next_backfill = None;
+		if let Some(mut token) = backfill {
+			for _ in 0..page_budget {
+				let page = self.list_keys_page(token).await?;
+				for key in page.keys {
+					if !seen.insert(key.clone()) {
+						return Err(Error::PersistenceFailed);
+					}
+					backfill_keys.push(key);
+				}
+				token = page.next_page_token;
+				if token.is_none() {
+					break;
+				}
+			}
+			next_backfill = token;
+		}
+		if created_keys.len() + backfill_keys.len() + reread.len() > object_limit {
+			return Err(Error::PersistenceFailed);
+		}
+		let created = self.read_listed(&created_keys).await?;
+		let backfill = self.read_listed(&backfill_keys).await?;
+		let mut reread_objects: Vec<Option<SO>> = vec![None; reread.len()];
+		self.read_missing(&mut reread_objects, reread.iter().cloned().enumerate().collect())
+			.await?;
+		let mut rereads = Vec::new();
+		let mut missing = Vec::new();
+		for (key, object) in reread.iter().zip(reread_objects) {
+			match object {
+				Some(object) if object.id().encode_to_hex_str() == *key => rereads.push(object),
+				Some(_) => return Err(Error::PersistenceFailed),
+				None => missing.push(key.clone()),
+			}
+		}
+		Ok((
+			revision,
+			DurableDelta {
+				head,
+				since_found,
+				created,
+				reread: rereads,
+				missing,
+				backfill,
+				next_backfill,
+			},
+		))
+	}
+
+	/// Reads listed keys from the store; a listed key that is gone or mismatched is a torn view.
+	async fn read_listed(&self, keys: &[String]) -> Result<Vec<SO>, Error> {
+		let mut objects: Vec<Option<SO>> = vec![None; keys.len()];
+		self.read_missing(&mut objects, keys.iter().cloned().enumerate().collect()).await?;
+		keys.iter()
+			.zip(objects)
+			.map(|(key, object)| match object {
+				Some(object) if object.id().encode_to_hex_str() == *key => Ok(object),
+				_ => Err(Error::PersistenceFailed),
+			})
+			.collect()
 	}
 
 	/// Revalidate a durable scan inside the coordinated component snapshot.
@@ -2174,6 +2311,90 @@ mod tests {
 		assert!(store.try_with_revision(current, || true).is_none());
 		drop(held);
 		assert!(store.try_with_revision(current, || true).unwrap());
+	}
+
+	fn hex_ids(objects: &[TestObject]) -> Vec<String> {
+		objects.iter().map(|o| o.id.encode_to_hex_str()).collect()
+	}
+
+	#[tokio::test]
+	async fn durable_delta_extends_from_the_reader_head_without_reading_history() {
+		let store = new_data_store(in_memory_store(), keep_lru(2), Vec::new());
+		let first = insert_ascending(&store, 3 * IN_MEMORY_PAGE_SIZE).await;
+
+		let (_, initial) = store.durable_delta(None, &[], None, 1, 100).await.unwrap();
+		assert_eq!(initial.head, Some(first.last().unwrap().id.encode_to_hex_str()));
+		assert!(initial.since_found);
+		assert!(initial.created.is_empty() && initial.backfill.is_empty());
+
+		let mut newer = Vec::new();
+		for i in 0..(IN_MEMORY_PAGE_SIZE + 5) {
+			let object =
+				TestObject::new(TestObjectId { id: (10_000 + i as u32).to_be_bytes() }, [1; 3]);
+			store.insert(object).await.unwrap();
+			newer.push(object);
+		}
+		let since = initial.head.unwrap();
+		let (revision, delta) =
+			store.durable_delta(Some(&since), &[], None, 2, 1_000).await.unwrap();
+		newer.reverse();
+		assert_eq!(hex_ids(&delta.created), hex_ids(&newer));
+		assert!(delta.since_found);
+		assert_eq!(delta.head, Some(newer[0].id.encode_to_hex_str()));
+		assert_eq!(store.cached_len(), 2);
+		assert!(store.try_with_revision(revision, || true).unwrap());
+
+		// Not enough pages to reach `since`: refuse rather than hand back a head past a hole.
+		assert!(store.durable_delta(Some(&since), &[], None, 1, 1_000).await.is_err());
+		// Nothing new since the head.
+		let head = delta.head.unwrap();
+		let (_, quiet) = store.durable_delta(Some(&head), &[], None, 1, 1_000).await.unwrap();
+		assert!(quiet.since_found && quiet.created.is_empty());
+	}
+
+	#[tokio::test]
+	async fn durable_delta_rereads_report_missing_and_backfill_resumes_to_the_end() {
+		let store = new_data_store(in_memory_store(), keep_lru(2), Vec::new());
+		let inserted = insert_ascending(&store, 2 * IN_MEMORY_PAGE_SIZE + 25).await;
+		store.remove(&inserted[3].id).await.unwrap();
+
+		let reread = vec![inserted[1].id.encode_to_hex_str(), inserted[3].id.encode_to_hex_str()];
+		let (_, delta) = store.durable_delta(None, &reread, None, 1, 1_000).await.unwrap();
+		assert_eq!(hex_ids(&delta.reread), vec![inserted[1].id.encode_to_hex_str()]);
+		assert_eq!(delta.missing, vec![inserted[3].id.encode_to_hex_str()]);
+
+		let mut backfilled = Vec::new();
+		let mut token = None;
+		loop {
+			let (_, delta) = store.durable_delta(None, &[], Some(token), 1, 1_000).await.unwrap();
+			backfilled.extend(hex_ids(&delta.backfill));
+			match delta.next_backfill {
+				Some(next) => token = Some(next),
+				None => break,
+			}
+		}
+		let mut expected: Vec<_> = inserted
+			.iter()
+			.filter(|o| o.id != inserted[3].id)
+			.map(|o| o.id.encode_to_hex_str())
+			.collect();
+		expected.reverse();
+		assert_eq!(backfilled, expected);
+	}
+
+	#[tokio::test]
+	async fn durable_delta_flags_a_vanished_head_and_bounds_its_reads() {
+		let store = new_data_store(in_memory_store(), KeepAllEntries, Vec::new());
+		let inserted = insert_ascending(&store, 5).await;
+		let gone = inserted[4].id.encode_to_hex_str();
+		store.remove(&inserted[4].id).await.unwrap();
+		let (_, delta) = store.durable_delta(Some(&gone), &[], None, 4, 100).await.unwrap();
+		assert!(!delta.since_found);
+		assert_eq!(delta.created.len(), 4);
+
+		assert!(store.durable_delta(Some(&gone), &[], None, 4, 3).await.is_err());
+		let reread: Vec<_> = inserted.iter().map(|o| o.id.encode_to_hex_str()).collect();
+		assert!(store.durable_delta(None, &reread, None, 1, 4).await.is_err());
 	}
 
 	#[tokio::test]
