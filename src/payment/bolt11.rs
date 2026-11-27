@@ -856,7 +856,53 @@ impl Bolt11Payment {
 		let usable_channels = self.channel_manager.list_usable_channels();
 		let first_hops = usable_channels.iter().collect::<Vec<_>>();
 		let inflight_htlcs = self.channel_manager.compute_inflight_htlcs();
-		Ok(self.router.find_route(&payer, &route_params, Some(&first_hops), inflight_htlcs).is_ok())
+		match self.router.find_route(&payer, &route_params, Some(&first_hops), inflight_htlcs) {
+			Ok(_) => Ok(true),
+			Err(e) => {
+				log_info!(
+					self.logger,
+					"No route for invoice {}: {} (amount {} msat, {} route hints, {} first hops, max fee {:?} msat, max CLTV delta {})",
+					invoice.payment_hash(),
+					e,
+					amount_msat,
+					invoice.route_hints().len(),
+					first_hops.len(),
+					route_params.max_total_routing_fee_msat,
+					route_params.payment_params.max_total_cltv_expiry_delta,
+				);
+				for (i, hint) in invoice.route_hints().iter().enumerate() {
+					for hop in hint.0.iter() {
+						let src_is_first_hop =
+							first_hops.iter().any(|c| c.counterparty.node_id == hop.src_node_id);
+						log_info!(
+							self.logger,
+							"  hint {}: src {} (first hop peer: {}), scid {}, cltv delta {}, fee {}+{}ppm, htlc min {:?} max {:?}",
+							i,
+							hop.src_node_id,
+							src_is_first_hop,
+							hop.short_channel_id,
+							hop.cltv_expiry_delta,
+							hop.fees.base_msat,
+							hop.fees.proportional_millionths,
+							hop.htlc_minimum_msat,
+							hop.htlc_maximum_msat,
+						);
+					}
+				}
+				for c in first_hops.iter() {
+					log_info!(
+						self.logger,
+						"  first hop: peer {}, scid {:?}, outbound {} msat, next htlc limit {} msat, min {} msat",
+						c.counterparty.node_id,
+						c.get_outbound_payment_scid(),
+						c.outbound_capacity_msat,
+						c.next_outbound_htlc_limit_msat,
+						c.next_outbound_htlc_minimum_msat,
+					);
+				}
+				Ok(false)
+			},
+		}
 	}
 
 	/// Sends payment probes over all paths of a route that would be used to pay the given invoice.
